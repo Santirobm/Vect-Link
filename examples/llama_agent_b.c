@@ -23,7 +23,13 @@
 
 #define DEFAULT_SHM_NAME   "/vtlk_llama_bridge"
 #define DEFAULT_N_PREDICT  32u
-#define MAX_SHM_MAP_BYTES  (64u * 1024u * 1024u)
+#define MAX_SHM_MAP_BYTES  (512u * 1024u * 1024u)
+#define VTLK_FLAG_KV_STATE (1u << 0)
+
+typedef enum vtlk_bridge_mode {
+    VTLK_MODE_EMBD = 0,
+    VTLK_MODE_KV_STATE = 1
+} vtlk_bridge_mode_t;
 
 static uint64_t now_ns(void)
 {
@@ -166,9 +172,23 @@ static void verify_against_ref(const char *ref_arg,
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s --model <path.gguf> [--shm /vtlk_llama_bridge] "
-            "[--n-predict 32] [--verify-ref <ref.bin|prompt>]\n",
+            "Usage: %s --model <path.gguf> [--mode embd|kv-state] "
+            "[--shm /vtlk_llama_bridge] [--n-predict 32] "
+            "[--verify-ref <ref.bin|prompt>]\n",
             prog);
+}
+
+static int parse_mode(const char *s, vtlk_bridge_mode_t *out)
+{
+    if (strcmp(s, "embd") == 0) {
+        *out = VTLK_MODE_EMBD;
+        return 1;
+    }
+    if (strcmp(s, "kv-state") == 0) {
+        *out = VTLK_MODE_KV_STATE;
+        return 1;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -176,6 +196,7 @@ int main(int argc, char **argv)
     const char *model_path = NULL;
     const char *shm_name = DEFAULT_SHM_NAME;
     const char *verify_ref = NULL;
+    vtlk_bridge_mode_t mode = VTLK_MODE_EMBD;
     uint32_t n_predict = DEFAULT_N_PREDICT;
     int i;
 
@@ -196,17 +217,26 @@ int main(int argc, char **argv)
     uint8_t *rx_payload = NULL;
     float *decoded = NULL;
     size_t rx_cap = MAX_SHM_MAP_BYTES;
-    size_t total_elems;
+    size_t total_elems = 0u;
     vtlk_status_t st;
     int retries;
     uint64_t t0;
     uint64_t t1;
+    uint64_t t_pop0;
+    uint64_t t_pop1;
+    uint64_t t_set0;
+    uint64_t t_set1;
     uint32_t step;
     int rc = 1;
 
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             model_path = argv[++i];
+        } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+            if (!parse_mode(argv[++i], &mode)) {
+                print_usage(argv[0]);
+                return 1;
+            }
         } else if (strcmp(argv[i], "--shm") == 0 && i + 1 < argc) {
             shm_name = argv[++i];
         } else if (strcmp(argv[i], "--n-predict") == 0 && i + 1 < argc) {
@@ -252,7 +282,7 @@ int main(int argc, char **argv)
 
     /* Open minimum 192B control block first to inspect ring size, or wait for SHM */
     st = VTLK_ERR_SHM;
-    for (retries = 0; retries < 300; ++retries) {
+    for (retries = 0; retries < 1500; ++retries) {
         st = vtlk_shm_open(&shm, shm_name, VTLK_RING_CTRL_SIZE);
         if (st == VTLK_OK) {
             break;
@@ -297,10 +327,11 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    t0 = now_ns();
     for (;;) {
+        t_pop0 = now_ns();
         st = vtlk_ring_pop(&ring, &hdr, rx_payload, ring.max_payload_bytes);
         if (st == VTLK_OK) {
+            t_pop1 = now_ns();
             break;
         }
         if (st == VTLK_ERR_EMPTY) {
@@ -311,47 +342,33 @@ int main(int argc, char **argv)
         vtlk_shm_close(&shm);
         goto cleanup;
     }
+    vtlk_shm_close(&shm);
 
     if (hdr.model_family_hash != expected_hash || hdr.d_model != expected_d_model) {
         fprintf(stderr,
-                "[Agent B] REJECTED incompatible tensor packet: "
+                "[Agent B] REJECTED incompatible packet: "
                 "got hash=0x%016llx d_model=%u, expected hash=0x%016llx d_model=%u\n",
                 (unsigned long long)hdr.model_family_hash, hdr.d_model,
                 (unsigned long long)expected_hash, expected_d_model);
-        vtlk_shm_close(&shm);
         goto cleanup;
     }
 
-    total_elems = (size_t)hdr.n_tokens * (size_t)hdr.d_model;
-    decoded = (float *)malloc(total_elems * sizeof(float));
-    if (decoded == NULL) {
-        fprintf(stderr, "llama_agent_b: OOM allocating decoded tensor\n");
-        vtlk_shm_close(&shm);
-        goto cleanup;
-    }
-
-    st = vtlk_decode_tensor(rx_payload, hdr.payload_bytes,
-                            hdr.n_tokens, hdr.d_model,
-                            (vtlk_quant_scheme_t)hdr.quant_scheme,
-                            decoded, total_elems);
-    t1 = now_ns();
-    vtlk_shm_close(&shm);
-
-    if (st != VTLK_OK) {
-        fprintf(stderr, "llama_agent_b: vtlk_decode_tensor failed (%d)\n", (int)st);
-        goto cleanup;
-    }
-
-    printf("[Agent B] Received & decoded %u x %u tensor (%u B INT4) in %.2f us\n",
-           hdr.n_tokens, hdr.d_model, hdr.payload_bytes, (double)(t1 - t0) / 1000.0);
-
-    if (verify_ref != NULL) {
-        verify_against_ref(verify_ref, model, vocab, decoded, hdr.n_tokens, hdr.d_model);
+    {
+        int pkt_is_kv = ((hdr.flags & VTLK_FLAG_KV_STATE) != 0u);
+        int want_kv = (mode == VTLK_MODE_KV_STATE);
+        if (pkt_is_kv != want_kv) {
+            fprintf(stderr,
+                    "[Agent B] REJECTED mode mismatch: packet flags=0x%08x (%s), "
+                    "expected --mode %s\n",
+                    hdr.flags, pkt_is_kv ? "kv-state" : "embd",
+                    want_kv ? "kv-state" : "embd");
+            goto cleanup;
+        }
     }
 
     cparams = llama_context_default_params();
     cparams.n_ctx = (hdr.n_tokens + n_predict < 512u) ? 512u : (hdr.n_tokens + n_predict + 64u);
-    cparams.n_batch = hdr.n_tokens;
+    cparams.n_batch = (hdr.n_tokens > 0u) ? hdr.n_tokens : 1u;
     cparams.embeddings = false;
 
     ctx = llama_init_from_model(model, cparams);
@@ -360,25 +377,93 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    /* Inject continuous embeddings directly into KV-cache via batch.embd (no tokens!) */
-    {
-        struct llama_batch embd_batch = llama_batch_init((int32_t)hdr.n_tokens,
-                                                         (int32_t)hdr.d_model, 1);
-        int32_t k;
-        embd_batch.n_tokens = (int32_t)hdr.n_tokens;
-        memcpy(embd_batch.embd, decoded, total_elems * sizeof(float));
-        for (k = 0; k < (int32_t)hdr.n_tokens; ++k) {
-            embd_batch.pos[k] = (llama_pos)k;
-            embd_batch.n_seq_id[k] = 1;
-            embd_batch.seq_id[k][0] = 0;
-            embd_batch.logits[k] = (k == (int32_t)hdr.n_tokens - 1) ? 1 : 0;
-        }
-        if (llama_decode(ctx, embd_batch) != 0) {
-            fprintf(stderr, "llama_agent_b: llama_decode(embd_batch) failed\n");
-            llama_batch_free(embd_batch);
+    if (mode == VTLK_MODE_EMBD) {
+        total_elems = (size_t)hdr.n_tokens * (size_t)hdr.d_model;
+        decoded = (float *)malloc(total_elems * sizeof(float));
+        if (decoded == NULL) {
+            fprintf(stderr, "llama_agent_b: OOM allocating decoded tensor\n");
             goto cleanup;
         }
-        llama_batch_free(embd_batch);
+
+        t0 = now_ns();
+        st = vtlk_decode_tensor(rx_payload, hdr.payload_bytes,
+                                hdr.n_tokens, hdr.d_model,
+                                (vtlk_quant_scheme_t)hdr.quant_scheme,
+                                decoded, total_elems);
+        t1 = now_ns();
+        if (st != VTLK_OK) {
+            fprintf(stderr, "llama_agent_b: vtlk_decode_tensor failed (%d)\n", (int)st);
+            goto cleanup;
+        }
+
+        printf("[Agent B] Mode: embd\n");
+        printf("[Agent B] Received & decoded %u x %u tensor (%u B INT4) in %.2f us\n",
+               hdr.n_tokens, hdr.d_model, hdr.payload_bytes,
+               (double)((t_pop1 - t_pop0) + (t1 - t0)) / 1000.0);
+
+        if (verify_ref != NULL) {
+            verify_against_ref(verify_ref, model, vocab, decoded, hdr.n_tokens, hdr.d_model);
+        }
+
+        /* Inject continuous embeddings directly into layer 0 via batch.embd */
+        {
+            struct llama_batch embd_batch = llama_batch_init((int32_t)hdr.n_tokens,
+                                                             (int32_t)hdr.d_model, 1);
+            int32_t k;
+            embd_batch.n_tokens = (int32_t)hdr.n_tokens;
+            memcpy(embd_batch.embd, decoded, total_elems * sizeof(float));
+            for (k = 0; k < (int32_t)hdr.n_tokens; ++k) {
+                embd_batch.pos[k] = (llama_pos)k;
+                embd_batch.n_seq_id[k] = 1;
+                embd_batch.seq_id[k][0] = 0;
+                embd_batch.logits[k] = (k == (int32_t)hdr.n_tokens - 1) ? 1 : 0;
+            }
+            if (llama_decode(ctx, embd_batch) != 0) {
+                fprintf(stderr, "llama_agent_b: llama_decode(embd_batch) failed\n");
+                llama_batch_free(embd_batch);
+                goto cleanup;
+            }
+            llama_batch_free(embd_batch);
+        }
+    } else {
+        size_t restored;
+        llama_token last_tok = (llama_token)hdr.pos_offset;
+        llama_pos last_pos = (llama_pos)(hdr.n_tokens - 1u);
+        struct llama_batch bridge_batch;
+
+        t_set0 = now_ns();
+        restored = llama_state_seq_set_data(ctx, rx_payload, hdr.payload_bytes, 0);
+        t_set1 = now_ns();
+        if (restored == 0u) {
+            fprintf(stderr, "llama_agent_b: llama_state_seq_set_data failed\n");
+            goto cleanup;
+        }
+
+        printf("[Agent B] Mode: kv-state\n");
+        printf("[Agent B] Received & restored KV-Cache (%u B, prompt=%u tokens) in %.2f us\n",
+               hdr.payload_bytes, hdr.n_tokens,
+               (double)((t_pop1 - t_pop0) + (t_set1 - t_set0)) / 1000.0);
+
+        /* Trim last prompt token position and re-evaluate it to obtain fresh deterministic logits */
+        if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, last_pos, -1)) {
+            fprintf(stderr, "llama_agent_b: llama_memory_seq_rm failed at pos %d\n",
+                    (int)last_pos);
+            goto cleanup;
+        }
+
+        bridge_batch = llama_batch_init(1, 0, 1);
+        bridge_batch.n_tokens = 1;
+        bridge_batch.token[0] = last_tok;
+        bridge_batch.pos[0] = last_pos;
+        bridge_batch.n_seq_id[0] = 1;
+        bridge_batch.seq_id[0][0] = 0;
+        bridge_batch.logits[0] = 1;
+        if (llama_decode(ctx, bridge_batch) != 0) {
+            fprintf(stderr, "llama_agent_b: llama_decode(bridge_batch) failed\n");
+            llama_batch_free(bridge_batch);
+            goto cleanup;
+        }
+        llama_batch_free(bridge_batch);
     }
 
     smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());

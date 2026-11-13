@@ -65,21 +65,47 @@ Make sure the directory containing `llama` / `ggml` shared libraries (`<llama.cp
 
 ## 4. Run Producer and Consumer in Two Terminals
 
-Start **Agent A (Producer)** first and leave it waiting at `(press Enter after Agent B finishes)` while **Agent B (Consumer)** runs in the second terminal. *(On Windows, named shared memory objects are released as soon as the creating handle closes, and Agent B polls for up to 6 seconds on startup.)*
+Start **Agent A (Producer)** first and leave it waiting at `(press Enter after Agent B finishes)` while **Agent B (Consumer)** runs in the second terminal. *(On Windows, named shared memory objects are released as soon as the creating handle closes, and Agent B polls for up to 30 seconds on startup.)*
 
-### Terminal 1 — Producer (`llama_agent_a`)
-```bash
-./build/llama_agent_a \
-  --model ./models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
-  --prompt "Explain shared-memory zero-copy IPC in one paragraph:" \
+Both processes support `--mode embd` (default: INT4-quantized latent tensor transfer) and `--mode kv-state` (full sequence KV-Cache state transfer via `llama_state_seq_get_data` / `llama_state_seq_set_data` for coherent multi-process continuation without repeating prefill).
+
+### Mode A: `--mode kv-state` (Coherent KV-Cache Transfer, recommended for text continuation)
+
+**Terminal 1 — Producer (`llama_agent_a`):**
+```powershell
+.\build-llama\llama_agent_a.exe `
+  --model C:\Users\sgi.lm\Desktop\models\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  --mode kv-state `
+  --prompt "Explain shared-memory zero-copy IPC in one paragraph:" `
   --shm /vtlk_llama_bridge
 ```
 
-### Terminal 2 — Consumer (`llama_agent_b`)
-```bash
-./build/llama_agent_b \
-  --model ./models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
-  --shm /vtlk_llama_bridge \
+**Terminal 2 — Consumer (`llama_agent_b`):**
+```powershell
+.\build-llama\llama_agent_b.exe `
+  --model C:\Users\sgi.lm\Desktop\models\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  --mode kv-state `
+  --shm /vtlk_llama_bridge `
+  --n-predict 40
+```
+
+### Mode B: `--mode embd` (INT4-Quantized Latent Tensor Transfer)
+
+**Terminal 1 — Producer (`llama_agent_a`):**
+```powershell
+.\build-llama\llama_agent_a.exe `
+  --model C:\Users\sgi.lm\Desktop\models\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  --mode embd `
+  --prompt "Explain shared-memory zero-copy IPC in one paragraph:" `
+  --shm /vtlk_llama_bridge
+```
+
+**Terminal 2 — Consumer (`llama_agent_b`):**
+```powershell
+.\build-llama\llama_agent_b.exe `
+  --model C:\Users\sgi.lm\Desktop\models\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  --mode embd `
+  --shm /vtlk_llama_bridge `
   --n-predict 24
 ```
 
@@ -91,54 +117,59 @@ Once Agent B completes and exits, press **Enter** in Terminal 1 to release the s
 
 Measured locally on Windows (`Clang 22.1.8 -O3`, shared `llama.cpp` CPU backend) with prompt `"Explain shared-memory zero-copy IPC in one paragraph:"`:
 
+### `--mode kv-state` (Sequence KV-Cache Transfer)
+- **Model metadata validated:** `qwen2 1B Q4_K - Medium` (`model_family_hash=0x35e1f62d1fa40244`, `d_model=896`)
+- **Transferred KV-Cache payload (`VTLK_FLAG_KV_STATE`, CRC32C protected):** `135,908 B` (`prompt=11 tokens`, `last_token=25`)
+- **Producer (`llama_agent_a`) `llama_state_seq_get_data` + `vtlk_ring_push`:** **`338.20 us`**
+- **Consumer (`llama_agent_b`) `vtlk_ring_pop` + `llama_state_seq_set_data`:** **`353.00 us`**
+- **Combined KV-Cache IPC latency:** **`691.20 us`** (`~0.69 ms`)
+- **Generated continuation (32 tokens):** coherent continuation directly resuming from the restored sequence state (`" Shared-memory zero-copy IPC is a type of inter-process communication (IPC) that allows two processes to communicate without exchanging any data. In this type of IPC,"`).
+
+### `--mode embd` (INT4 Latent Tensor Transfer)
 - **Model metadata validated:** `qwen2 1B Q4_K - Medium` (`model_family_hash=0x35e1f62d1fa40244`, `d_model=896`)
 - **Tensor shape & compression:** `11 tokens x 896 dims` — `39,424 B FP32 -> 5,544 B INT4` (**`7.11x`** compression)
-- **Producer (`llama_agent_a`) Encode + SHM Push:** **`30.50 us`**
-- **Consumer (`llama_agent_b`) SHM Pop + INT4 Decode:** **`22.70 us`**
-- **Combined IPC + Quantization/Dequantization latency:** **`53.20 us`**
+- **Producer (`llama_agent_a`) Encode + SHM Push:** **`28.80 us`**
+- **Consumer (`llama_agent_b`) SHM Pop + INT4 Decode:** **`15.40 us`**
+- **Combined IPC + Quantization/Dequantization latency:** **`44.20 us`**
 - **Tensor reconstruction fidelity (`--dump-ref` / `--verify-ref`):** Cosine Similarity = **`0.985879`** (`Max Abs Error: 11.92352`)
 
-### Architecture Note: Layer Alignment & Next Step (KV-Cache Transfer)
+### Architecture Note: Layer Alignment (`--mode embd` vs `--mode kv-state`)
 
-This PoC proves live cross-process extraction, `INT4_BLOCK` quantization, shared-memory ring-buffer transport, and strict `model_family_hash` / `d_model` validation across two independent `llama.cpp` OS processes in **~53 us** total.
-
-Notice, however, why raw text continuation from `llama_agent_b` currently collapses into repetitive tokens (e.g. `" is is is..."`):
-- `llama_get_embeddings_ith()` reads the **final-layer (Layer N, post-RMSNorm)** output hidden states.
-- `llama_batch.embd` in `llama.cpp` injects continuous embeddings into **Layer 0** (the model input space). Re-injecting Layer N representations into Layer 0 passes those vectors through all transformer blocks a second time, producing a layer-misalignment attractor collapse.
-
-**Natural next step:** To achieve 100% semantically coherent multi-process continuation without repeating prefill, either:
-1. **Transfer Sequence KV-Cache State:** Extract accumulated `K`/`V` context state with `llama_state_seq_get_size()` / `llama_state_seq_get_data()`, transport it over a `VTLK` frame (`VTLK_QUANT_FP16` or `VTLK_QUANT_INT4`), and restore it in Agent B via `llama_state_seq_set_data()` before calling `llama_decode()` on the final prompt token, or
-2. **Layer-to-Layer Adapter:** Train/project a lightweight linear adapter mapping Layer N hidden states back into Layer 0 soft-prompt space.
+- In `--mode embd`, `llama_get_embeddings_ith()` reads the **final-layer (Layer N, post-RMSNorm)** output hidden states, whereas `llama_batch.embd` injects vectors into **Layer 0**. Passing Layer N outputs back into Layer 0 collapses autoregressive generation into repetitive tokens (`" is is is..."`).
+- `--mode kv-state` resolves this cleanly in `llama.cpp` by moving the accumulated sequence KV-Cache state (`llama_state_seq_get_data` → `VTLK` SHM frame with `VTLK_FLAG_KV_STATE` → `llama_state_seq_set_data`), trimming position `n_tokens - 1` via `llama_memory_seq_rm`, and re-evaluating `last_token` (`header.pos_offset`) to produce deterministic logits without repeating full prefill.
 
 ---
 
-## 6. Fidelity Verification (`--dump-ref` / `--verify-ref`)
+## 6. Fidelity Verification (`--dump-ref` / `--verify-ref`, `--mode embd`)
 
 To measure end-to-end cosine similarity between the original FP32 embeddings in `llama_agent_a` and the INT4-reconstructed tensor received by `llama_agent_b`:
 
 1. Run **Agent A** with `--dump-ref ref_embd.bin`:
-   ```bash
-   ./build/llama_agent_a \
-     --model ./models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
-     --prompt "Explain shared-memory zero-copy IPC in one paragraph:" \
-     --shm /vtlk_llama_bridge \
+   ```powershell
+   .\build-llama\llama_agent_a.exe `
+     --model C:\Users\sgi.lm\Desktop\models\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+     --mode embd `
+     --prompt "Explain shared-memory zero-copy IPC in one paragraph:" `
+     --shm /vtlk_llama_bridge `
      --dump-ref ref_embd.bin
    ```
 2. Run **Agent B** with `--verify-ref ref_embd.bin` (or pass a raw prompt string to `--verify-ref` so Agent B computes reference embeddings locally for comparison):
-   ```bash
-   ./build/llama_agent_b \
-     --model ./models/Llama-3.2-1B-Instruct-Q4_K_M.gguf \
-     --shm /vtlk_llama_bridge \
-     --n-predict 32 \
+   ```powershell
+   .\build-llama\llama_agent_b.exe `
+     --model C:\Users\sgi.lm\Desktop\models\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+     --mode embd `
+     --shm /vtlk_llama_bridge `
+     --n-predict 24 `
      --verify-ref ref_embd.bin
    ```
 
 ---
 
-## 7. Model Compatibility Validation (Mismatch Rejection)
+## 7. Model & Mode Compatibility Validation (Mismatch Rejection)
 
-`llama_agent_b` computes the 64-bit FNV-1a hash of its own loaded `llama_model_desc` and checks both:
+`llama_agent_b` validates:
 1. `header.model_family_hash == local_family_hash`
 2. `header.d_model == local_d_model`
+3. `(header.flags & VTLK_FLAG_KV_STATE)` matches its own `--mode` (`embd` vs `kv-state`)
 
-If you run `llama_agent_a` with e.g. `Qwen2.5-1.5B` and `llama_agent_b` with `Llama-3.2-1B`, `llama_agent_b` rejects the frame with an explicit mismatch diagnostic instead of feeding incompatible latent representations into `llama_decode`.
+Mismatched models or mismatched `--mode` flags are rejected explicitly before touching `llama_decode` or `llama_state_seq_set_data`.
