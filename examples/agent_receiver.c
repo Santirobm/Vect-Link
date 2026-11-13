@@ -1,3 +1,9 @@
+#ifndef _WIN32
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 #include "vectlink/transport.h"
 
 #include <stdio.h>
@@ -11,7 +17,7 @@
 #include <windows.h>
 #else
 #include <sched.h>
-#include <unistd.h>
+#include <time.h>
 #endif
 
 #define DEFAULT_SHM_NAME    "/vectlink_ipc_demo"
@@ -33,7 +39,10 @@ static void demo_sleep_ms(unsigned int ms)
 #ifdef _WIN32
     Sleep((DWORD)ms);
 #else
-    usleep(ms * 1000u);
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ms / 1000u);
+    ts.tv_nsec = (long)((ms % 1000u) * 1000000u);
+    nanosleep(&ts, NULL);
 #endif
 }
 
