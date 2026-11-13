@@ -10,6 +10,21 @@ typedef char vtlk_static_assert_f32_size[(sizeof(float) == 4u) ? 1 : -1];
 #error "IEEE-754 binary floating-point (FLT_RADIX == 2) is required"
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#define VTLK_ARCH_X86 1
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__GNUC__) || defined(__clang__)
+#include <cpuid.h>
+#endif
+#else
+#define VTLK_ARCH_X86 0
+#endif
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 static inline float vtlk_sanitize_finite_f32(float x)
 {
     uint32_t u;
@@ -19,88 +34,6 @@ static inline float vtlk_sanitize_finite_f32(float x)
     }
     return x;
 }
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-
-static inline __m256 vtlk_sanitize_finite_avx2(__m256 v)
-{
-    __m256i exp_mask = _mm256_set1_epi32(0x7F800000);
-    __m256i is_nonfinite = _mm256_cmpeq_epi32(
-        _mm256_and_si256(_mm256_castps_si256(v), exp_mask), exp_mask);
-    return _mm256_andnot_ps(_mm256_castsi256_ps(is_nonfinite), v);
-}
-
-static void vtlk_int4_encode_block_avx2(const float block_src[32],
-                                        uint8_t block_dst[18])
-{
-    __m256 v0 = vtlk_sanitize_finite_avx2(_mm256_loadu_ps(block_src + 0u));
-    __m256 v1 = vtlk_sanitize_finite_avx2(_mm256_loadu_ps(block_src + 8u));
-    __m256 v2 = vtlk_sanitize_finite_avx2(_mm256_loadu_ps(block_src + 16u));
-    __m256 v3 = vtlk_sanitize_finite_avx2(_mm256_loadu_ps(block_src + 24u));
-
-    __m256 sign_mask = _mm256_set1_ps(-0.0f);
-    __m256 m01 = _mm256_max_ps(_mm256_andnot_ps(sign_mask, v0),
-                               _mm256_andnot_ps(sign_mask, v1));
-    __m256 m23 = _mm256_max_ps(_mm256_andnot_ps(sign_mask, v2),
-                               _mm256_andnot_ps(sign_mask, v3));
-    __m256 m = _mm256_max_ps(m01, m23);
-
-    __m128 hi = _mm256_extractf128_ps(m, 1);
-    __m128 lo = _mm256_castps256_ps128(m);
-    __m128 m4 = _mm_max_ps(lo, hi);
-    __m128 m2 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
-    __m128 m1 = _mm_max_ss(m2, _mm_shuffle_ps(m2, m2, 1));
-    float max_abs = _mm_cvtss_f32(m1);
-
-    float d_raw = (max_abs > 0.0f) ? (max_abs / 7.0f) : 0.0f;
-    uint16_t scale_fp16 = vtlk_fp32_to_fp16(d_raw);
-    float d_eff = vtlk_fp16_to_fp32(scale_fp16);
-
-    if (d_eff <= 0.0f) {
-        vtlk_write_u16_le(block_dst, 0u);
-        memset(block_dst + 2u, 0x88, VTLK_INT4_BLOCK_SIZE / 2u);
-        return;
-    }
-
-    {
-        float inv_d = 1.0f / d_eff;
-        __m256 v_inv_d = _mm256_set1_ps(inv_d);
-        __m256 v_fmin = _mm256_set1_ps(-8.0f);
-        __m256 v_fmax = _mm256_set1_ps(7.0f);
-        __m256i v_off = _mm256_set1_epi32(8);
-
-        __m256 s0 = _mm256_min_ps(v_fmax, _mm256_max_ps(v_fmin, _mm256_mul_ps(v0, v_inv_d)));
-        __m256 s1 = _mm256_min_ps(v_fmax, _mm256_max_ps(v_fmin, _mm256_mul_ps(v1, v_inv_d)));
-        __m256 s2 = _mm256_min_ps(v_fmax, _mm256_max_ps(v_fmin, _mm256_mul_ps(v2, v_inv_d)));
-        __m256 s3 = _mm256_min_ps(v_fmax, _mm256_max_ps(v_fmin, _mm256_mul_ps(v3, v_inv_d)));
-
-        __m256i q0 = _mm256_add_epi32(
-            _mm256_cvtps_epi32(_mm256_round_ps(s0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)),
-            v_off);
-        __m256i q1 = _mm256_add_epi32(
-            _mm256_cvtps_epi32(_mm256_round_ps(s1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)),
-            v_off);
-        __m256i q2 = _mm256_add_epi32(
-            _mm256_cvtps_epi32(_mm256_round_ps(s2, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)),
-            v_off);
-        __m256i q3 = _mm256_add_epi32(
-            _mm256_cvtps_epi32(_mm256_round_ps(s3, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)),
-            v_off);
-
-        __m256i p01 = _mm256_permute4x64_epi64(_mm256_packs_epi32(q0, q1), 0xD8);
-        __m256i p23 = _mm256_permute4x64_epi64(_mm256_packs_epi32(q2, q3), 0xD8);
-        __m256i bytes32 = _mm256_permute4x64_epi64(_mm256_packus_epi16(p01, p23), 0xD8);
-        __m256i pairs16 = _mm256_maddubs_epi16(bytes32, _mm256_set1_epi16(0x1001));
-        __m256i packed = _mm256_permute4x64_epi64(
-            _mm256_packus_epi16(pairs16, _mm256_setzero_si256()), 0xD8);
-
-        vtlk_write_u16_le(block_dst, scale_fp16);
-        _mm_storeu_si128((__m128i *)(void *)(block_dst + 2u),
-                         _mm256_castsi256_si128(packed));
-    }
-}
-#endif /* __AVX2__ */
 
 static inline uint8_t vtlk_quantize_nibble_ieee(float x, float inv_d)
 {
@@ -161,22 +94,128 @@ void vtlk_int4_encode_block_scalar(const float src[32], uint8_t dst[18])
     }
 }
 
-int vtlk_int4_has_avx2_path(void)
+int vtlk_cpu_supports_avx2(void)
 {
-#if defined(__AVX2__)
+#if !VTLK_ARCH_X86
+    return 0;
+#elif defined(_MSC_VER)
+    int info[4];
+    unsigned __int64 xcr0;
+    int osxsave_avx;
+
+    __cpuidex(info, 0, 0);
+    if (info[0] < 7) {
+        return 0;
+    }
+
+    __cpuidex(info, 1, 0);
+    osxsave_avx = (1 << 27) | (1 << 28);
+    if ((info[2] & osxsave_avx) != osxsave_avx) {
+        return 0;
+    }
+
+    xcr0 = _xgetbv(0);
+    if ((xcr0 & 0x6u) != 0x6u) {
+        return 0;
+    }
+
+    __cpuidex(info, 7, 0);
+    if ((info[1] & (1 << 5)) == 0) {
+        return 0;
+    }
+
+    return 1;
+#elif defined(__GNUC__) || defined(__clang__)
+    unsigned int eax = 0u;
+    unsigned int ebx = 0u;
+    unsigned int ecx = 0u;
+    unsigned int edx = 0u;
+    unsigned int xcr0_lo = 0u;
+    unsigned int xcr0_hi = 0u;
+    unsigned int osxsave_avx = (1u << 27) | (1u << 28);
+
+    if (__get_cpuid_max(0u, NULL) < 7u) {
+        return 0;
+    }
+
+    if (!__get_cpuid(1u, &eax, &ebx, &ecx, &edx)) {
+        return 0;
+    }
+    if ((ecx & osxsave_avx) != osxsave_avx) {
+        return 0;
+    }
+
+    __asm__ __volatile__(".byte 0x0f, 0x01, 0xd0"
+                         : "=a"(xcr0_lo), "=d"(xcr0_hi)
+                         : "c"(0u));
+    (void)xcr0_hi;
+    if ((xcr0_lo & 0x6u) != 0x6u) {
+        return 0;
+    }
+
+    if (!__get_cpuid_count(7u, 0u, &eax, &ebx, &ecx, &edx)) {
+        return 0;
+    }
+    if ((ebx & (1u << 5)) == 0u) {
+        return 0;
+    }
+
     return 1;
 #else
     return 0;
 #endif
 }
 
-void vtlk_int4_encode_block_avx2_dispatch(const float src[32], uint8_t dst[18])
+int vtlk_int4_has_avx2_runtime(void)
 {
-#if defined(__AVX2__)
-    vtlk_int4_encode_block_avx2(src, dst);
+    return vtlk_cpu_supports_avx2();
+}
+
+typedef void (*vtlk_int4_block_fn)(const float src[32], uint8_t dst[18]);
+
+static void vtlk_int4_encode_block_resolve(const float src[32], uint8_t dst[18]);
+
+static vtlk_int4_block_fn vtlk_int4_block_impl = vtlk_int4_encode_block_resolve;
+
+static vtlk_int4_block_fn vtlk_atomic_load_block_fn(void)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    return __atomic_load_n(&vtlk_int4_block_impl, __ATOMIC_ACQUIRE);
+#elif defined(_MSC_VER)
+    void *p = _InterlockedCompareExchangePointer(
+        (void * volatile *)&vtlk_int4_block_impl, NULL, NULL);
+    _ReadWriteBarrier();
+    return (vtlk_int4_block_fn)(uintptr_t)p;
 #else
-    vtlk_int4_encode_block_scalar(src, dst);
+    return vtlk_int4_block_impl;
 #endif
+}
+
+static void vtlk_atomic_store_block_fn(vtlk_int4_block_fn fn)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_store_n(&vtlk_int4_block_impl, fn, __ATOMIC_RELEASE);
+#elif defined(_MSC_VER)
+    _ReadWriteBarrier();
+    (void)_InterlockedExchangePointer(
+        (void * volatile *)&vtlk_int4_block_impl, (void *)(uintptr_t)fn);
+#else
+    vtlk_int4_block_impl = fn;
+#endif
+}
+
+static void vtlk_int4_encode_block_resolve(const float src[32], uint8_t dst[18])
+{
+    vtlk_int4_block_fn chosen = vtlk_int4_encode_block_scalar;
+
+#if VTLK_ARCH_X86
+    if (vtlk_cpu_supports_avx2()) {
+        chosen = vtlk_int4_encode_block_avx2;
+    }
+#endif
+
+    vtlk_atomic_store_block_fn(chosen);
+    chosen(src, dst);
 }
 
 vtlk_status_t vtlk_int4_encode_raw(const float *src,
@@ -184,16 +223,11 @@ vtlk_status_t vtlk_int4_encode_raw(const float *src,
                                    uint8_t *dst)
 {
     size_t num_blocks = total_elements / VTLK_INT4_BLOCK_SIZE;
+    vtlk_int4_block_fn fn = vtlk_atomic_load_block_fn();
     size_t b;
 
     for (b = 0u; b < num_blocks; ++b) {
-        const float *block_src = src + b * VTLK_INT4_BLOCK_SIZE;
-        uint8_t *block_dst = dst + b * VTLK_INT4_BLOCK_BYTES;
-#if defined(__AVX2__)
-        vtlk_int4_encode_block_avx2(block_src, block_dst);
-#else
-        vtlk_int4_encode_block_scalar(block_src, block_dst);
-#endif
+        fn(src + b * VTLK_INT4_BLOCK_SIZE, dst + b * VTLK_INT4_BLOCK_BYTES);
     }
 
     return VTLK_OK;

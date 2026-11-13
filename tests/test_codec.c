@@ -341,8 +341,8 @@ static void test_int4_scalar_avx2_parity(void)
     uint32_t rng = 0x51525354u;
     size_t blk;
 
-    if (!vtlk_int4_has_avx2_path()) {
-        printf("[INFO] AVX2 not enabled in this build; scalar path only.\n");
+    if (!vtlk_int4_has_avx2_runtime()) {
+        printf("[INFO] Runtime CPUID+XGETBV: AVX2 unavailable; scalar path active.\n");
         return;
     }
 
@@ -350,6 +350,8 @@ static void test_int4_scalar_avx2_parity(void)
         float block[32];
         uint8_t out_scalar[18];
         uint8_t out_avx2[18];
+        uint8_t out_api[18];
+        size_t written = 0u;
         size_t i;
 
         for (i = 0u; i < 32u; ++i) {
@@ -367,8 +369,17 @@ static void test_int4_scalar_avx2_parity(void)
         }
 
         vtlk_int4_encode_block_scalar(block, out_scalar);
-        vtlk_int4_encode_block_avx2_dispatch(block, out_avx2);
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        vtlk_int4_encode_block_avx2(block, out_avx2);
+#else
+        vtlk_int4_encode_block_scalar(block, out_avx2);
+#endif
         assert(memcmp(out_scalar, out_avx2, sizeof(out_scalar)) == 0);
+
+        assert(vtlk_encode_tensor(block, 1u, 32u, VTLK_QUANT_INT4,
+                                  out_api, sizeof(out_api), &written) == VTLK_OK);
+        assert(written == sizeof(out_api));
+        assert(memcmp(out_api, out_avx2, sizeof(out_api)) == 0);
     }
 
     printf("[INFO] AVX2 bit-exact parity verified across 1000 blocks.\n");
@@ -380,6 +391,7 @@ static void test_int4_nan_inf_underflow_robustness(void)
     float dec[32];
     uint8_t out_scalar[18];
     uint8_t out_avx2[18];
+    uint8_t out_api[18];
     size_t i;
     size_t written = 0u;
     uint32_t nan_bits = 0x7FC00001u;
@@ -417,14 +429,14 @@ static void test_int4_nan_inf_underflow_robustness(void)
     block[4] = -1.75f;
 
     assert(vtlk_encode_tensor(block, 1u, 32u, VTLK_QUANT_INT4,
-                              out_scalar, sizeof(out_scalar), &written) == VTLK_OK);
+                              out_api, sizeof(out_api), &written) == VTLK_OK);
     assert(written == 18u);
 
     /* Scale in bytes 0..1 must be finite and equal 3.5f / 7.0f = 0.5f */
-    scale_fp16 = (uint16_t)((uint16_t)out_scalar[0] | ((uint16_t)out_scalar[1] << 8));
+    scale_fp16 = (uint16_t)((uint16_t)out_api[0] | ((uint16_t)out_api[1] << 8));
     assert(vtlk_fp16_to_fp32(scale_fp16) == 0.5f);
 
-    assert(vtlk_decode_tensor(out_scalar, written, 1u, 32u, VTLK_QUANT_INT4,
+    assert(vtlk_decode_tensor(out_api, written, 1u, 32u, VTLK_QUANT_INT4,
                               dec, 32u) == VTLK_OK);
 
     /* +Inf, -Inf, and NaN slots must decode deterministically to 0.0f */
@@ -434,10 +446,15 @@ static void test_int4_nan_inf_underflow_robustness(void)
     assert(dec[3] == 3.5f);
     assert(isfinite(dec[4]));
 
-    /* Scalar and AVX2 dispatch must produce identical 18 bytes */
+    /* Scalar, AVX2, and public API must produce identical 18 bytes */
     vtlk_int4_encode_block_scalar(block, out_scalar);
-    vtlk_int4_encode_block_avx2_dispatch(block, out_avx2);
-    assert(memcmp(out_scalar, out_avx2, sizeof(out_scalar)) == 0);
+    assert(memcmp(out_api, out_scalar, sizeof(out_api)) == 0);
+    if (vtlk_int4_has_avx2_runtime()) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        vtlk_int4_encode_block_avx2(block, out_avx2);
+        assert(memcmp(out_scalar, out_avx2, sizeof(out_scalar)) == 0);
+#endif
+    }
 }
 
 int main(void)
