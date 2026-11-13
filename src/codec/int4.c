@@ -96,7 +96,7 @@ void vtlk_int4_encode_block_scalar(const float src[32], uint8_t dst[18])
 
 int vtlk_cpu_supports_avx2(void)
 {
-#if !VTLK_ARCH_X86
+#if !VTLK_ARCH_X86 || defined(VTLK_DISABLE_AVX2)
     return 0;
 #elif defined(_MSC_VER)
     int info[4];
@@ -173,49 +173,37 @@ int vtlk_int4_has_avx2_runtime(void)
 
 typedef void (*vtlk_int4_block_fn)(const float src[32], uint8_t dst[18]);
 
-static void vtlk_int4_encode_block_resolve(const float src[32], uint8_t dst[18]);
+/* 0 = unresolved, 1 = scalar, 2 = avx2 */
+#if defined(_MSC_VER)
+static long g_avx2_state = 0L;
+#else
+static int g_avx2_state = 0;
+#endif
 
-static vtlk_int4_block_fn vtlk_int4_block_impl = vtlk_int4_encode_block_resolve;
-
-static vtlk_int4_block_fn vtlk_atomic_load_block_fn(void)
+static int vtlk_int4_resolve_state(void)
 {
 #if defined(__GNUC__) || defined(__clang__)
-    return __atomic_load_n(&vtlk_int4_block_impl, __ATOMIC_ACQUIRE);
-#elif defined(_MSC_VER)
-    void *p = _InterlockedCompareExchangePointer(
-        (void * volatile *)&vtlk_int4_block_impl, NULL, NULL);
-    _ReadWriteBarrier();
-    return (vtlk_int4_block_fn)(uintptr_t)p;
-#else
-    return vtlk_int4_block_impl;
-#endif
-}
-
-static void vtlk_atomic_store_block_fn(vtlk_int4_block_fn fn)
-{
-#if defined(__GNUC__) || defined(__clang__)
-    __atomic_store_n(&vtlk_int4_block_impl, fn, __ATOMIC_RELEASE);
-#elif defined(_MSC_VER)
-    _ReadWriteBarrier();
-    (void)_InterlockedExchangePointer(
-        (void * volatile *)&vtlk_int4_block_impl, (void *)(uintptr_t)fn);
-#else
-    vtlk_int4_block_impl = fn;
-#endif
-}
-
-static void vtlk_int4_encode_block_resolve(const float src[32], uint8_t dst[18])
-{
-    vtlk_int4_block_fn chosen = vtlk_int4_encode_block_scalar;
-
-#if VTLK_ARCH_X86
-    if (vtlk_cpu_supports_avx2()) {
-        chosen = vtlk_int4_encode_block_avx2;
+    int state = __atomic_load_n(&g_avx2_state, __ATOMIC_ACQUIRE);
+    if (state == 0) {
+        state = vtlk_cpu_supports_avx2() ? 2 : 1;
+        __atomic_store_n(&g_avx2_state, state, __ATOMIC_RELEASE);
     }
+    return state;
+#elif defined(_MSC_VER)
+    long state = _InterlockedCompareExchange(&g_avx2_state, 0L, 0L);
+    _ReadWriteBarrier();
+    if (state == 0L) {
+        state = vtlk_cpu_supports_avx2() ? 2L : 1L;
+        _ReadWriteBarrier();
+        (void)_InterlockedExchange(&g_avx2_state, state);
+    }
+    return (int)state;
+#else
+    if (g_avx2_state == 0) {
+        g_avx2_state = vtlk_cpu_supports_avx2() ? 2 : 1;
+    }
+    return g_avx2_state;
 #endif
-
-    vtlk_atomic_store_block_fn(chosen);
-    chosen(src, dst);
 }
 
 vtlk_status_t vtlk_int4_encode_raw(const float *src,
@@ -223,8 +211,16 @@ vtlk_status_t vtlk_int4_encode_raw(const float *src,
                                    uint8_t *dst)
 {
     size_t num_blocks = total_elements / VTLK_INT4_BLOCK_SIZE;
-    vtlk_int4_block_fn fn = vtlk_atomic_load_block_fn();
+    vtlk_int4_block_fn fn = vtlk_int4_encode_block_scalar;
     size_t b;
+
+#if VTLK_ARCH_X86 && !defined(VTLK_DISABLE_AVX2)
+    if (vtlk_int4_resolve_state() == 2) {
+        fn = vtlk_int4_encode_block_avx2;
+    }
+#else
+    (void)vtlk_int4_resolve_state();
+#endif
 
     for (b = 0u; b < num_blocks; ++b) {
         fn(src + b * VTLK_INT4_BLOCK_SIZE, dst + b * VTLK_INT4_BLOCK_BYTES);

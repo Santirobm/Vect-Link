@@ -5,6 +5,8 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+option(VTLK_DISABLE_AVX2 "Disable AVX2 runtime dispatch (simulate legacy CPU)" OFF)
+
 set(VECTLINK_SOURCES
     src/integrity/crc32c.c
     src/protocol/header.c
@@ -16,10 +18,12 @@ set(VECTLINK_SOURCES
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|amd64|x86_64|X86_64|i686|x86")
     list(APPEND VECTLINK_SOURCES src/codec/int4_avx2.c)
-    if(MSVC)
-        set_source_files_properties(src/codec/int4_avx2.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-    else()
-        set_source_files_properties(src/codec/int4_avx2.c PROPERTIES COMPILE_OPTIONS "-mavx2")
+    if(NOT VTLK_DISABLE_AVX2)
+        if(MSVC)
+            set_source_files_properties(src/codec/int4_avx2.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        else()
+            set_source_files_properties(src/codec/int4_avx2.c PROPERTIES COMPILE_OPTIONS "-mavx2")
+        endif()
     endif()
 endif()
 
@@ -51,6 +55,10 @@ if(MSVC)
     target_compile_options(vectlink PRIVATE /W4 /WX)
 else()
     target_compile_options(vectlink PRIVATE -Wall -Wextra -Werror -pedantic)
+endif()
+
+if(VTLK_DISABLE_AVX2)
+    target_compile_definitions(vectlink PRIVATE VTLK_DISABLE_AVX2=1)
 endif()
 
 function(vectlink_add_test target_name source_file)
