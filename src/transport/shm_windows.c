@@ -71,6 +71,10 @@ vtlk_status_t vtlk_shm_create(vtlk_shm_t *shm, const char *name, size_t size)
     if (h_map == NULL) {
         return VTLK_ERR_SHM;
     }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(h_map);
+        return VTLK_ERR_SHM;
+    }
 
     addr = MapViewOfFile(h_map, FILE_MAP_ALL_ACCESS, 0u, 0u, size);
     if (addr == NULL) {
@@ -113,6 +117,15 @@ vtlk_status_t vtlk_shm_open(vtlk_shm_t *shm, const char *name, size_t size)
     if (addr == NULL) {
         CloseHandle(h_map);
         return VTLK_ERR_SHM;
+    }
+
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0 || mbi.RegionSize < size) {
+            UnmapViewOfFile(addr);
+            CloseHandle(h_map);
+            return VTLK_ERR_SHM;
+        }
     }
 
     shm->addr = addr;

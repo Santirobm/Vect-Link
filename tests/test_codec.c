@@ -1,3 +1,9 @@
+#ifndef _WIN32
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 #include "vectlink/vectlink.h"
 
 #include <assert.h>
@@ -5,6 +11,37 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
+extern void vtlk_int4_encode_block_scalar(const float *block_src, uint8_t *block_dst);
+#if defined(__AVX2__)
+extern void vtlk_int4_encode_block_avx2(const float *block_src, uint8_t *block_dst);
+#endif
+
+static void *test_alloc_aligned64(size_t bytes)
+{
+#ifdef _WIN32
+    return _aligned_malloc(bytes, 64u);
+#else
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, 64u, bytes) != 0) {
+        return NULL;
+    }
+    return ptr;
+#endif
+}
+
+static void test_free_aligned64(void *ptr)
+{
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
 
 static uint32_t test_prng_u32(uint32_t *state)
 {
@@ -202,7 +239,7 @@ static void test_end_to_end_int4_over_spsc(void)
     uint32_t rng = 0xCAFEBABEu;
     size_t i;
 
-    uint64_t arena[2048];
+    uint8_t *arena;
     size_t ring_bytes;
     vtlk_ring_t prod;
     vtlk_ring_t cons;
@@ -218,7 +255,9 @@ static void test_end_to_end_int4_over_spsc(void)
                               enc, sizeof(enc), &enc_bytes) == VTLK_OK);
 
     ring_bytes = vtlk_ring_required_bytes(4u, (uint32_t)enc_bytes, NULL);
-    assert(ring_bytes > 0u && ring_bytes <= sizeof(arena));
+    assert(ring_bytes > 0u);
+    arena = (uint8_t *)test_alloc_aligned64(ring_bytes);
+    assert(arena != NULL);
     assert(vtlk_ring_init(&prod, arena, ring_bytes, 4u, (uint32_t)enc_bytes) == VTLK_OK);
     assert(vtlk_ring_attach(&cons, arena, ring_bytes) == VTLK_OK);
 
@@ -245,6 +284,7 @@ static void test_end_to_end_int4_over_spsc(void)
 
     cos_sim = vtlk_cosine_similarity(src, dst, TOTAL);
     assert(cos_sim > 0.990);
+    test_free_aligned64(arena);
 }
 
 static void test_int4_boundary_consistency(void)
@@ -300,6 +340,92 @@ static void test_int4_boundary_consistency(void)
     assert(cos_sim > 0.995);
 }
 
+static void test_int4_scalar_avx2_parity(void)
+{
+#if defined(__AVX2__)
+    uint32_t rng = 0x51525354u;
+    size_t blk;
+
+    for (blk = 0u; blk < 1000u; ++blk) {
+        float block[32];
+        uint8_t out_scalar[18];
+        uint8_t out_avx2[18];
+        size_t i;
+
+        for (i = 0u; i < 32u; ++i) {
+            if (blk == 0u) {
+                block[i] = 0.0f;
+            } else if (blk == 1u) {
+                /* Exact x.5 ties and extremes */
+                static const float ties[8] = {
+                    -8.0f, -7.5f, -2.5f, -1.5f, 0.5f, 1.5f, 2.5f, 7.0f
+                };
+                block[i] = ties[i % 8u];
+            } else {
+                block[i] = test_sample_activation(&rng);
+            }
+        }
+
+        vtlk_int4_encode_block_scalar(block, out_scalar);
+        vtlk_int4_encode_block_avx2(block, out_avx2);
+        assert(memcmp(out_scalar, out_avx2, sizeof(out_scalar)) == 0);
+    }
+#endif
+}
+
+static void test_int4_nan_inf_underflow_robustness(void)
+{
+    float block[32];
+    float dec[32];
+    uint8_t out_scalar[18];
+    size_t i;
+    size_t written = 0u;
+    uint32_t nan_bits = 0x7FC00001u;
+    uint32_t inf_bits = 0x7F800000u;
+    uint32_t ninf_bits = 0xFF800000u;
+    float f_nan;
+    float f_inf;
+    float f_ninf;
+
+    memcpy(&f_nan, &nan_bits, sizeof(f_nan));
+    memcpy(&f_inf, &inf_bits, sizeof(f_inf));
+    memcpy(&f_ninf, &ninf_bits, sizeof(f_ninf));
+
+    /* 1. Subnormals & scale underflow to 0 in FP16 (1e-12f, 1e-38f) */
+    for (i = 0u; i < 32u; ++i) {
+        block[i] = ((i % 2u) == 0u) ? 1e-12f : -1e-38f;
+    }
+    assert(vtlk_encode_tensor(block, 1u, 32u, VTLK_QUANT_INT4,
+                              out_scalar, sizeof(out_scalar), &written) == VTLK_OK);
+    assert(written == 18u);
+    assert(out_scalar[0] == 0u && out_scalar[1] == 0u);
+    for (i = 2u; i < 18u; ++i) {
+        assert(out_scalar[i] == 0x88u);
+    }
+
+    /* 2. NaN, +Inf, -Inf must not trigger UB or non-finite output */
+    for (i = 0u; i < 32u; ++i) {
+        block[i] = 1.0f;
+    }
+    block[0] = f_nan;
+    block[1] = f_inf;
+    block[2] = f_ninf;
+
+    assert(vtlk_encode_tensor(block, 1u, 32u, VTLK_QUANT_INT4,
+                              out_scalar, sizeof(out_scalar), &written) == VTLK_OK);
+    assert(vtlk_decode_tensor(out_scalar, written, 1u, 32u, VTLK_QUANT_INT4,
+                              dec, 32u) == VTLK_OK);
+
+#if defined(__AVX2__)
+    {
+        uint8_t out_avx2[18];
+        vtlk_int4_encode_block_scalar(block, out_scalar);
+        vtlk_int4_encode_block_avx2(block, out_avx2);
+        assert(memcmp(out_scalar, out_avx2, sizeof(out_scalar)) == 0);
+    }
+#endif
+}
+
 int main(void)
 {
     test_fp16_edge_cases();
@@ -308,6 +434,8 @@ int main(void)
     test_codec_errors();
     test_end_to_end_int4_over_spsc();
     test_int4_boundary_consistency();
+    test_int4_scalar_avx2_parity();
+    test_int4_nan_inf_underflow_robustness();
 
     printf("All Vect-Link codec tests passed.\n");
     return 0;

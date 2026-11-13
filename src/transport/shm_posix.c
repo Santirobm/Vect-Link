@@ -1,8 +1,8 @@
-#ifndef _WIN32
-
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
+
+#ifndef _WIN32
 
 #include "vectlink/transport.h"
 
@@ -60,7 +60,7 @@ vtlk_status_t vtlk_shm_create(vtlk_shm_t *shm, const char *name, size_t size)
         return st;
     }
 
-    fd = shm_open(shm->name, O_CREAT | O_RDWR, 0600);
+    fd = shm_open(shm->name, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0) {
         return VTLK_ERR_SHM;
     }
@@ -109,6 +109,14 @@ vtlk_status_t vtlk_shm_open(vtlk_shm_t *shm, const char *name, size_t size)
     fd = shm_open(shm->name, O_RDWR, 0600);
     if (fd < 0) {
         return VTLK_ERR_SHM;
+    }
+
+    {
+        struct stat st_buf;
+        if (fstat(fd, &st_buf) != 0 || st_buf.st_size < (off_t)size) {
+            close(fd);
+            return VTLK_ERR_SHM;
+        }
     }
 
     addr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

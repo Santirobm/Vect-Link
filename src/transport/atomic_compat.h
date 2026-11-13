@@ -3,7 +3,13 @@
 
 #include <stdint.h>
 
+typedef char vtlk_static_assert_u64_size[(sizeof(uint64_t) == 8u) ? 1 : -1];
+
 #if defined(__GNUC__) || defined(__clang__)
+
+#if defined(__GCC_ATOMIC_LLONG_LOCK_FREE) && (__GCC_ATOMIC_LLONG_LOCK_FREE < 2)
+#error "64-bit lock-free atomics are required on this architecture"
+#endif
 
 static inline uint64_t vtlk_atomic_load_acquire_u64(const uint64_t *ptr)
 {

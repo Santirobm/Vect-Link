@@ -87,8 +87,8 @@ vtlk_status_t vtlk_ring_init(vtlk_ring_t *ring,
     if (ring == NULL || mem == NULL) {
         return VTLK_ERR_NULL_PTR;
     }
-    if (((uintptr_t)mem & 7u) != 0u) {
-        return VTLK_ERR_INVALID_PARAM;
+    if (((uintptr_t)mem % (uintptr_t)VTLK_RING_CACHE_LINE) != 0u) {
+        return VTLK_ERR_INVALID_ARG;
     }
 
     required = vtlk_ring_required_bytes(capacity, max_payload_bytes, &slot_size);
@@ -137,8 +137,8 @@ vtlk_status_t vtlk_ring_attach(vtlk_ring_t *ring,
     if (ring == NULL || mem == NULL) {
         return VTLK_ERR_NULL_PTR;
     }
-    if (((uintptr_t)mem & 7u) != 0u) {
-        return VTLK_ERR_INVALID_PARAM;
+    if (((uintptr_t)mem % (uintptr_t)VTLK_RING_CACHE_LINE) != 0u) {
+        return VTLK_ERR_INVALID_ARG;
     }
     if (mem_bytes < VTLK_RING_CTRL_SIZE) {
         return VTLK_ERR_BUFFER_TOO_SMALL;

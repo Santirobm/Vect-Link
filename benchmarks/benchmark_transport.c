@@ -576,6 +576,7 @@ static bench_result_t run_vtlk_shm_bench(const float *src, size_t json_wire_byte
     ring_bytes = vtlk_ring_required_bytes(8u, (uint32_t)payload_bytes, NULL);
     VTLK_BENCH_CHECK(ring_bytes > 0u);
 
+    (void)vtlk_shm_unlink(shm_name);
     VTLK_BENCH_CHECK(vtlk_shm_create(&shm, shm_name, ring_bytes) == VTLK_OK);
     VTLK_BENCH_CHECK(vtlk_ring_init(&ring, shm.addr, shm.size, 8u, (uint32_t)payload_bytes) == VTLK_OK);
 

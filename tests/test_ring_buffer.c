@@ -1,8 +1,41 @@
+#ifndef _WIN32
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 #include "vectlink/transport.h"
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
+static void *test_alloc_aligned64(size_t bytes)
+{
+#ifdef _WIN32
+    return _aligned_malloc(bytes, 64u);
+#else
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, 64u, bytes) != 0) {
+        return NULL;
+    }
+    return ptr;
+#endif
+}
+
+static void test_free_aligned64(void *ptr)
+{
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
 
 static void make_header(vtlk_header_t *hdr, uint64_t seq, uint32_t payload_bytes)
 {
@@ -18,7 +51,7 @@ static void test_required_bytes_and_init(void)
 {
     uint32_t slot_size = 0u;
     size_t req;
-    uint64_t buf[512];
+    uint8_t *buf;
     vtlk_ring_t ring;
 
     /* Non-power-of-two capacity must fail */
@@ -31,14 +64,23 @@ static void test_required_bytes_and_init(void)
     assert(slot_size == 192u);
     assert(req == 192u + 4u * 192u);
 
+    buf = (uint8_t *)test_alloc_aligned64(req + 64u);
+    assert(buf != NULL);
+
+    /* Unaligned pointer must be rejected with VTLK_ERR_INVALID_ARG */
+    assert(vtlk_ring_init(&ring, buf + 8u, req, 4u, 100u) == VTLK_ERR_INVALID_ARG);
+    assert(vtlk_ring_attach(&ring, buf + 8u, req) == VTLK_ERR_INVALID_ARG);
+
     /* Buffer too small */
     assert(vtlk_ring_init(&ring, buf, req - 1u, 4u, 100u) == VTLK_ERR_BUFFER_TOO_SMALL);
     assert(vtlk_ring_init(&ring, buf, req, 4u, 100u) == VTLK_OK);
+
+    test_free_aligned64(buf);
 }
 
 static void test_fifo_full_empty_wraparound(void)
 {
-    uint64_t arena[1024];
+    uint8_t *arena;
     vtlk_ring_t prod;
     vtlk_ring_t cons;
     uint32_t capacity = 4u;
@@ -51,7 +93,9 @@ static void test_fifo_full_empty_wraparound(void)
     uint64_t i;
 
     req = vtlk_ring_required_bytes(capacity, max_payload, NULL);
-    assert(req > 0u && req <= sizeof(arena));
+    assert(req > 0u);
+    arena = (uint8_t *)test_alloc_aligned64(req);
+    assert(arena != NULL);
 
     assert(vtlk_ring_init(&prod, arena, req, capacity, max_payload) == VTLK_OK);
     assert(vtlk_ring_attach(&cons, arena, req) == VTLK_OK);
@@ -94,12 +138,13 @@ static void test_fifo_full_empty_wraparound(void)
         assert(h_out.payload_bytes == sz);
         assert(memcmp(p_in, p_out, sz) == 0);
     }
+
+    test_free_aligned64(arena);
 }
 
 static void test_payload_corruption_detection(void)
 {
-    uint64_t arena[512];
-    uint8_t *raw = (uint8_t *)arena;
+    uint8_t *raw;
     vtlk_ring_t prod;
     vtlk_ring_t cons;
     size_t req;
@@ -109,9 +154,12 @@ static void test_payload_corruption_detection(void)
     uint8_t p_out[64];
 
     req = vtlk_ring_required_bytes(4u, 64u, NULL);
-    assert(req > 0u && req <= sizeof(arena));
-    assert(vtlk_ring_init(&prod, arena, req, 4u, 64u) == VTLK_OK);
-    assert(vtlk_ring_attach(&cons, arena, req) == VTLK_OK);
+    assert(req > 0u);
+    raw = (uint8_t *)test_alloc_aligned64(req);
+    assert(raw != NULL);
+
+    assert(vtlk_ring_init(&prod, raw, req, 4u, 64u) == VTLK_OK);
+    assert(vtlk_ring_attach(&cons, raw, req) == VTLK_OK);
 
     /* Push packet into slot 0 */
     memset(p_in, 0xAB, sizeof(p_in));
@@ -122,6 +170,8 @@ static void test_payload_corruption_detection(void)
     raw[VTLK_RING_CTRL_SIZE + VTLK_HEADER_SIZE + 10u] ^= 0x01u;
 
     assert(vtlk_ring_pop(&cons, &h_out, p_out, sizeof(p_out)) == VTLK_ERR_CRC_MISMATCH);
+
+    test_free_aligned64(raw);
 }
 
 int main(void)

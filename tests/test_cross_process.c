@@ -126,6 +126,7 @@ static int run_producer(const char *exe_path)
     req = vtlk_ring_required_bytes(XPROC_CAPACITY, XPROC_PAYLOAD_SZ, NULL);
     assert(req > 0u);
 
+    (void)vtlk_shm_unlink(shm_name);
     st = vtlk_shm_create(&shm, shm_name, req);
     assert(st == VTLK_OK);
 

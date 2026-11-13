@@ -52,6 +52,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    (void)vtlk_shm_unlink(shm_name);
     st = vtlk_shm_create(&shm, shm_name, req);
     if (st != VTLK_OK) {
         fprintf(stderr, "agent_sender: vtlk_shm_create(%s) failed (%d)\n", shm_name, (int)st);

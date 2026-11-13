@@ -33,7 +33,11 @@ target_include_directories(vectlink
 )
 
 if(UNIX AND NOT APPLE)
-    target_link_libraries(vectlink PUBLIC rt m)
+    find_package(Threads REQUIRED)
+    target_link_libraries(vectlink PUBLIC rt m Threads::Threads)
+elseif(UNIX)
+    find_package(Threads REQUIRED)
+    target_link_libraries(vectlink PUBLIC Threads::Threads)
 endif()
 
 if(MSVC)

@@ -1,6 +1,12 @@
 #ifndef VECTLINK_BENCH_TIMER_H
 #define VECTLINK_BENCH_TIMER_H
 
+#ifndef _WIN32
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
