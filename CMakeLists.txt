@@ -6,6 +6,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 option(VTLK_DISABLE_AVX2 "Disable AVX2 runtime dispatch (simulate legacy CPU)" OFF)
+option(VTLK_BUILD_LLAMA_BRIDGE "Build llama.cpp latent bridge example" OFF)
 
 set(VECTLINK_SOURCES
     src/integrity/crc32c.c
@@ -115,4 +116,69 @@ if(MSVC)
     target_compile_options(benchmark_transport PRIVATE /O2 /W4 /WX)
 else()
     target_compile_options(benchmark_transport PRIVATE -O3 -Wall -Wextra -Werror -pedantic)
+endif()
+
+if(VTLK_BUILD_LLAMA_BRIDGE)
+    set(LLAMA_CPP_DIR "" CACHE PATH "Path to llama.cpp repository root containing include/ and build/")
+    if(NOT LLAMA_CPP_DIR)
+        message(FATAL_ERROR "VTLK_BUILD_LLAMA_BRIDGE=ON requires -DLLAMA_CPP_DIR=<path to llama.cpp>")
+    endif()
+
+    find_path(LLAMA_INCLUDE_DIR
+        NAMES llama.h
+        PATHS "${LLAMA_CPP_DIR}/include" "${LLAMA_CPP_DIR}"
+        NO_DEFAULT_PATH
+    )
+    find_path(GGML_INCLUDE_DIR
+        NAMES ggml.h
+        PATHS "${LLAMA_CPP_DIR}/ggml/include" "${LLAMA_CPP_DIR}/include" "${LLAMA_CPP_DIR}"
+        NO_DEFAULT_PATH
+    )
+    find_library(LLAMA_LIBRARY
+        NAMES llama libllama
+        PATHS
+            "${LLAMA_CPP_DIR}/build/src"
+            "${LLAMA_CPP_DIR}/build/src/Release"
+            "${LLAMA_CPP_DIR}/build/bin"
+            "${LLAMA_CPP_DIR}/build/bin/Release"
+            "${LLAMA_CPP_DIR}/build/lib"
+            "${LLAMA_CPP_DIR}/build/lib/Release"
+            "${LLAMA_CPP_DIR}/build"
+        NO_DEFAULT_PATH
+    )
+
+    if(NOT LLAMA_INCLUDE_DIR)
+        message(FATAL_ERROR "Could not find llama.h under LLAMA_CPP_DIR=${LLAMA_CPP_DIR}")
+    endif()
+    if(NOT LLAMA_LIBRARY)
+        message(FATAL_ERROR "Could not find llama library under ${LLAMA_CPP_DIR}/build")
+    endif()
+
+    set(VTLK_LLAMA_INCLUDES "${LLAMA_INCLUDE_DIR}")
+    if(GGML_INCLUDE_DIR)
+        list(APPEND VTLK_LLAMA_INCLUDES "${GGML_INCLUDE_DIR}")
+    endif()
+
+    foreach(llama_target llama_agent_a llama_agent_b)
+        add_executable(${llama_target} examples/${llama_target}.c)
+        # llama.h and ggml.h use C11 features (_Noreturn, typedef redefs, anonymous unions)
+        set_target_properties(${llama_target} PROPERTIES
+            C_STANDARD 11
+            C_STANDARD_REQUIRED ON
+            C_EXTENSIONS OFF
+        )
+        target_include_directories(${llama_target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${VTLK_LLAMA_INCLUDES}
+        )
+        target_link_libraries(${llama_target} PRIVATE vectlink "${LLAMA_LIBRARY}")
+        if(NOT WIN32)
+            target_link_libraries(${llama_target} PRIVATE pthread m)
+        endif()
+        if(MSVC)
+            target_compile_options(${llama_target} PRIVATE /W4 /WX)
+        else()
+            target_compile_options(${llama_target} PRIVATE -Wall -Wextra -Werror)
+        endif()
+    endforeach()
 endif()
