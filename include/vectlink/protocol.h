@@ -26,6 +26,7 @@ typedef enum vtlk_status {
     VTLK_ERR_UNSUPPORTED_VERSION = -5,
     VTLK_ERR_CRC_MISMATCH = -6,
     VTLK_ERR_INVALID_PARAM = -7,
+    VTLK_ERR_INVALID_ARG = -7,
     VTLK_ERR_FULL = -8,
     VTLK_ERR_EMPTY = -9,
     VTLK_ERR_SHM = -10
@@ -34,6 +35,7 @@ typedef enum vtlk_status {
 typedef enum vtlk_quant_scheme {
     VTLK_QUANT_FP16 = 0,
     VTLK_QUANT_INT4_BLOCK = 1,
+    VTLK_QUANT_INT4 = 1,
     VTLK_QUANT_RVQ10 = 2
 } vtlk_quant_scheme_t;
 

@@ -2,6 +2,7 @@
 build/
 cmake-build-*/
 out/
+benchmark_results.csv
 
 # Binaries & artifacts
 *.exe
