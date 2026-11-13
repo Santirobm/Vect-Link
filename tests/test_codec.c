@@ -5,6 +5,7 @@
 #endif
 
 #include "vectlink/vectlink.h"
+#include "codec/int4_internal.h"
 
 #include <assert.h>
 #include <math.h>
@@ -14,11 +15,6 @@
 
 #ifdef _WIN32
 #include <malloc.h>
-#endif
-
-extern void vtlk_int4_encode_block_scalar(const float *block_src, uint8_t *block_dst);
-#if defined(__AVX2__)
-extern void vtlk_int4_encode_block_avx2(const float *block_src, uint8_t *block_dst);
 #endif
 
 static void *test_alloc_aligned64(size_t bytes)
@@ -342,9 +338,13 @@ static void test_int4_boundary_consistency(void)
 
 static void test_int4_scalar_avx2_parity(void)
 {
-#if defined(__AVX2__)
     uint32_t rng = 0x51525354u;
     size_t blk;
+
+    if (!vtlk_int4_has_avx2_path()) {
+        printf("[INFO] AVX2 not enabled in this build; scalar path only.\n");
+        return;
+    }
 
     for (blk = 0u; blk < 1000u; ++blk) {
         float block[32];
@@ -367,10 +367,11 @@ static void test_int4_scalar_avx2_parity(void)
         }
 
         vtlk_int4_encode_block_scalar(block, out_scalar);
-        vtlk_int4_encode_block_avx2(block, out_avx2);
+        vtlk_int4_encode_block_avx2_dispatch(block, out_avx2);
         assert(memcmp(out_scalar, out_avx2, sizeof(out_scalar)) == 0);
     }
-#endif
+
+    printf("[INFO] AVX2 bit-exact parity verified across 1000 blocks.\n");
 }
 
 static void test_int4_nan_inf_underflow_robustness(void)
@@ -378,6 +379,7 @@ static void test_int4_nan_inf_underflow_robustness(void)
     float block[32];
     float dec[32];
     uint8_t out_scalar[18];
+    uint8_t out_avx2[18];
     size_t i;
     size_t written = 0u;
     uint32_t nan_bits = 0x7FC00001u;
@@ -386,6 +388,7 @@ static void test_int4_nan_inf_underflow_robustness(void)
     float f_nan;
     float f_inf;
     float f_ninf;
+    uint16_t scale_fp16;
 
     memcpy(&f_nan, &nan_bits, sizeof(f_nan));
     memcpy(&f_inf, &inf_bits, sizeof(f_inf));
@@ -403,27 +406,38 @@ static void test_int4_nan_inf_underflow_robustness(void)
         assert(out_scalar[i] == 0x88u);
     }
 
-    /* 2. NaN, +Inf, -Inf must not trigger UB or non-finite output */
+    /* 2. Mixed +Inf, -Inf, NaN with finite values (3.5f, -1.75f) */
     for (i = 0u; i < 32u; ++i) {
-        block[i] = 1.0f;
+        block[i] = 0.0f;
     }
-    block[0] = f_nan;
-    block[1] = f_inf;
-    block[2] = f_ninf;
+    block[0] = f_inf;
+    block[1] = f_ninf;
+    block[2] = f_nan;
+    block[3] = 3.5f;
+    block[4] = -1.75f;
 
     assert(vtlk_encode_tensor(block, 1u, 32u, VTLK_QUANT_INT4,
                               out_scalar, sizeof(out_scalar), &written) == VTLK_OK);
+    assert(written == 18u);
+
+    /* Scale in bytes 0..1 must be finite and equal 3.5f / 7.0f = 0.5f */
+    scale_fp16 = (uint16_t)((uint16_t)out_scalar[0] | ((uint16_t)out_scalar[1] << 8));
+    assert(vtlk_fp16_to_fp32(scale_fp16) == 0.5f);
+
     assert(vtlk_decode_tensor(out_scalar, written, 1u, 32u, VTLK_QUANT_INT4,
                               dec, 32u) == VTLK_OK);
 
-#if defined(__AVX2__)
-    {
-        uint8_t out_avx2[18];
-        vtlk_int4_encode_block_scalar(block, out_scalar);
-        vtlk_int4_encode_block_avx2(block, out_avx2);
-        assert(memcmp(out_scalar, out_avx2, sizeof(out_scalar)) == 0);
-    }
-#endif
+    /* +Inf, -Inf, and NaN slots must decode deterministically to 0.0f */
+    assert(dec[0] == 0.0f);
+    assert(dec[1] == 0.0f);
+    assert(dec[2] == 0.0f);
+    assert(dec[3] == 3.5f);
+    assert(isfinite(dec[4]));
+
+    /* Scalar and AVX2 dispatch must produce identical 18 bytes */
+    vtlk_int4_encode_block_scalar(block, out_scalar);
+    vtlk_int4_encode_block_avx2_dispatch(block, out_avx2);
+    assert(memcmp(out_scalar, out_avx2, sizeof(out_scalar)) == 0);
 }
 
 int main(void)
