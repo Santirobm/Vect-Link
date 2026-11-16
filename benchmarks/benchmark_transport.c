@@ -38,6 +38,9 @@ typedef HANDLE vtlk_thread_t;
 #include <sched.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#ifndef INADDR_LOOPBACK
+#define INADDR_LOOPBACK 0x7F000001u
+#endif
 typedef int vtlk_sock_t;
 typedef pthread_t vtlk_thread_t;
 #define VTLK_INVALID_SOCK (-1)
