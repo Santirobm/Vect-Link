@@ -1,5 +1,5 @@
 [build-system]
-requires = ["scikit-build-core>=0.9"]
+requires = ["scikit-build-core>=0.10"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -17,6 +17,6 @@ numpy = ["numpy>=1.21"]
 
 [tool.scikit-build]
 cmake.source-dir = ".."
-cmake.targets = ["vectlink_shared"]
+build.targets = ["vectlink_shared"]
 wheel.packages = ["vectlink"]
 build.verbose = false
