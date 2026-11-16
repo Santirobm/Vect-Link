@@ -390,7 +390,6 @@ static void test_int4_nan_inf_underflow_robustness(void)
     float block[32];
     float dec[32];
     uint8_t out_scalar[18];
-    uint8_t out_avx2[18];
     uint8_t out_api[18];
     size_t i;
     size_t written = 0u;
@@ -451,6 +450,7 @@ static void test_int4_nan_inf_underflow_robustness(void)
     assert(memcmp(out_api, out_scalar, sizeof(out_api)) == 0);
     if (vtlk_int4_has_avx2_runtime()) {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        uint8_t out_avx2[18];
         vtlk_int4_encode_block_avx2(block, out_avx2);
         assert(memcmp(out_scalar, out_avx2, sizeof(out_scalar)) == 0);
 #endif
