@@ -7,6 +7,7 @@ Zero-dependency **C99** binary protocol, quantization codecs, and lock-free shar
 - **64-byte Binary Wire Format:** Little-endian serialized `VTLK` header with Castagnoli **CRC32C** over header `[0..59]` and payload (`VTLK_QUANT_FP16`, `VTLK_QUANT_INT4_BLOCK`, `VTLK_QUANT_RAW`).
 - **Lock-Free SPSC Ring Buffer over OS Shared Memory:** Cache-line-isolated 192B control block with acquire/release atomic barriers (`CreateFileMappingA`/`MapViewOfFile` on Windows, `shm_open`/`mmap` on POSIX).
 - **Portable FP16 / INT4_BLOCK Codecs with Runtime AVX2 Dispatch:** Branchless `libm`-free C99 scalar fast-path plus translation-unit-isolated AVX2 acceleration (`src/codec/int4_avx2.c`) dispatched dynamically via `CPUID + XGETBV`, deterministic non-finite (`NaN`/`Inf`) sanitization, and bit-exact scalar/AVX2 parity.
+- **Zero-Copy Python Bindings (`python/vectlink`):** Dependency-free `ctypes` + `memoryview` wrapper over `vectlink_shared` (`vectlink.dll` / `libvectlink.so` / `libvectlink.dylib`) with `WriteSlot` / `ReadSlot` context managers, use-after-release protection, and zero-copy NumPy interop ([python/README.md](python/README.md)).
 - **Real Multi-Process `llama.cpp` IPC Bridge (optional PoC):** Connects two independent `llama.cpp` processes over Vect-Link SHM with strict GGUF weight/metadata & KV-layout compatibility hashing ([examples/README_LLAMA.md](examples/README_LLAMA.md)):
   - **`--mode kv-state`** (coherent continuation via sequence KV-Cache state transfer): `135,908 B` state + `16 B` `vtlk_llama_kv_meta_t`, **`106.80 us`** extract+commit and **`106.40 us`** acquire+restore (`~213 us` combined) with `v0.9.0` True Zero-Copy Slot Loan + SSE4.2 CRC32C on `qwen2.5-0.5b-instruct-q4_k_m.gguf`. In the two-process OS scaling benchmark (`benchmark_llama_multiprocess`, `n_ctx = 2304`, `threads = 4`), cross-process handoff scales from **16.10x** (`128` tokens: `364.21 ms` → `22.62 ms`) up to **184.49x p50 / 197.42x p99** (`2048` tokens, `25.19 MB` KV state: `7,366.57 ms` → `39.93 ms`) with exact Top-1 greedy token parity.
   - **`--mode embd`** (INT4-quantized tensor transport & reconstruction benchmark): `11 x 896` FP32 -> `5,544 B` INT4 (**`7.11x`** compression), **`~44 us`** combined encode+push+pop+decode (`28.80 us` + `15.40 us`), **`0.985879`** cosine similarity *(demonstrates Layer-N post-RMSNorm vs Layer-0 `batch.embd` alignment requirement)*.
@@ -69,6 +70,12 @@ examples/
   benchmark_llama_handoff.c
   benchmark_llama_multiprocess.c
   README_LLAMA.md
+python/
+  pyproject.toml
+  README.md
+  vectlink/       # _ffi.py, ring.py, __init__.py
+  tests/          # test_vectlink_python.py
+  examples/       # two_agents_zero_copy.py
 ```
 
 ## Build & Run Tests (CMake + Ninja)

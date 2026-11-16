@@ -8,6 +8,24 @@
 extern "C" {
 #endif
 
+#ifndef VTLK_API
+#  if defined(_WIN32) || defined(__CYGWIN__)
+#    if defined(VTLK_BUILDING_SHARED)
+#      define VTLK_API __declspec(dllexport)
+#    else
+#      define VTLK_API
+#    endif
+#  elif defined(__GNUC__) || defined(__clang__)
+#    if defined(VTLK_BUILDING_SHARED)
+#      define VTLK_API __attribute__((visibility("default")))
+#    else
+#      define VTLK_API
+#    endif
+#  else
+#    define VTLK_API
+#  endif
+#endif
+
 #define VTLK_HEADER_SIZE      64u
 #define VTLK_PROTOCOL_VERSION 0x0001u
 #define VTLK_LAYER_FINAL      0xFFFFu
@@ -87,7 +105,7 @@ typedef struct vtlk_header {
  *
  * @param hdr Pointer to the header struct to initialize (no-op if NULL).
  */
-void vtlk_header_init_defaults(vtlk_header_t *hdr);
+VTLK_API void vtlk_header_init_defaults(vtlk_header_t *hdr);
 
 /**
  * @brief Serializes a vtlk_header_t into a 64-byte little-endian wire buffer.
@@ -99,9 +117,9 @@ void vtlk_header_init_defaults(vtlk_header_t *hdr);
  * @param buf_len Size of destination buffer in bytes (must be >= 64).
  * @return VTLK_OK on success, or a negative vtlk_status_t error code.
  */
-vtlk_status_t vtlk_header_encode(const vtlk_header_t *hdr,
-                                 uint8_t *buf,
-                                 size_t buf_len);
+VTLK_API vtlk_status_t vtlk_header_encode(const vtlk_header_t *hdr,
+                                          uint8_t *buf,
+                                          size_t buf_len);
 
 /**
  * @brief Deserializes and validates a 64-byte little-endian wire header.
@@ -114,9 +132,9 @@ vtlk_status_t vtlk_header_encode(const vtlk_header_t *hdr,
  * @param hdr     Destination header struct (untouched on error).
  * @return VTLK_OK on success, or a negative vtlk_status_t error code.
  */
-vtlk_status_t vtlk_header_decode(const uint8_t *buf,
-                                 size_t buf_len,
-                                 vtlk_header_t *hdr);
+VTLK_API vtlk_status_t vtlk_header_decode(const uint8_t *buf,
+                                          size_t buf_len,
+                                          vtlk_header_t *hdr);
 
 #ifdef __cplusplus
 }

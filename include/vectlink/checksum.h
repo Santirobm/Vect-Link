@@ -1,6 +1,8 @@
 #ifndef VECTLINK_CHECKSUM_H
 #define VECTLINK_CHECKSUM_H
 
+#include "vectlink/protocol.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -16,7 +18,7 @@ extern "C" {
  * @param len  Number of bytes to process.
  * @return 32-bit CRC32C checksum.
  */
-uint32_t vtlk_crc32c(const void *data, size_t len);
+VTLK_API uint32_t vtlk_crc32c(const void *data, size_t len);
 
 /**
  * @brief Incrementally updates a running CRC32C (Castagnoli) checksum.
@@ -29,7 +31,7 @@ uint32_t vtlk_crc32c(const void *data, size_t len);
  * @param len  Number of bytes to process.
  * @return Updated 32-bit CRC32C checksum.
  */
-uint32_t vtlk_crc32c_update(uint32_t crc, const void *data, size_t len);
+VTLK_API uint32_t vtlk_crc32c_update(uint32_t crc, const void *data, size_t len);
 
 #ifdef __cplusplus
 }

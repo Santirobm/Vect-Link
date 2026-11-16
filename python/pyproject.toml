@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vectlink"
+version = "0.9.0"
+description = "Zero-copy Python ctypes + memoryview bindings for Vect-Link shared-memory IPC and tensor codecs"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Santirobm" }]
+dependencies = []
+
+[project.optional-dependencies]
+numpy = ["numpy>=1.21"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vectlink*"]

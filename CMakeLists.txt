@@ -65,6 +65,33 @@ if(VTLK_DISABLE_AVX2)
     target_compile_definitions(vectlink PRIVATE VTLK_DISABLE_AVX2=1)
 endif()
 
+add_library(vectlink_shared SHARED ${VECTLINK_SOURCES})
+set_target_properties(vectlink_shared PROPERTIES OUTPUT_NAME "vectlink")
+if(WIN32)
+    set_target_properties(vectlink_shared PROPERTIES PREFIX "")
+endif()
+target_include_directories(vectlink_shared
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(vectlink_shared PUBLIC rt m Threads::Threads)
+elseif(UNIX)
+    target_link_libraries(vectlink_shared PUBLIC Threads::Threads)
+endif()
+if(MSVC)
+    target_compile_options(vectlink_shared PRIVATE /W4 /WX)
+else()
+    target_compile_options(vectlink_shared PRIVATE -Wall -Wextra -Werror -pedantic -fvisibility=hidden)
+endif()
+target_compile_definitions(vectlink_shared PRIVATE VTLK_BUILDING_SHARED=1)
+if(VTLK_DISABLE_AVX2)
+    target_compile_definitions(vectlink_shared PRIVATE VTLK_DISABLE_AVX2=1)
+endif()
+
 function(vectlink_add_test target_name source_file)
     add_executable(${target_name} ${source_file})
     target_link_libraries(${target_name} PRIVATE vectlink)

@@ -24,3 +24,8 @@ ref_embd.bin
 .vscode/
 .idea/
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
