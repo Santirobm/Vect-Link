@@ -1,5 +1,6 @@
 #include "vectlink/protocol.h"
 #include "vectlink/checksum.h"
+#include "integrity/crc32c_internal.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -39,6 +40,30 @@ static void test_crc32c_vectors(void)
     /* 32 zero bytes */
     c_zeros = vtlk_crc32c(zeros, sizeof(zeros));
     assert(c_zeros == 0x8A9136AAu);
+
+    /* Scalar vs runtime (SSE4.2) bit-for-bit parity across lengths & alignments */
+    {
+        static const size_t k_lengths[] = { 0u, 1u, 7u, 8u, 15u, 64u, 4099u };
+        static const size_t k_offsets[] = { 0u, 1u, 3u, 5u };
+        uint8_t buf[4099u + 8u];
+        size_t i;
+        size_t li;
+        size_t oi;
+
+        for (i = 0u; i < sizeof(buf); ++i) {
+            buf[i] = (uint8_t)((i * 131u + 17u) & 0xFFu);
+        }
+
+        for (oi = 0u; oi < sizeof(k_offsets) / sizeof(k_offsets[0]); ++oi) {
+            size_t off = k_offsets[oi];
+            for (li = 0u; li < sizeof(k_lengths) / sizeof(k_lengths[0]); ++li) {
+                size_t len = k_lengths[li];
+                uint32_t c_ref = vtlk_crc32c_scalar(buf + off, len);
+                uint32_t c_rt = vtlk_crc32c(buf + off, len);
+                assert(c_ref == c_rt);
+            }
+        }
+    }
 }
 
 static void test_roundtrip_and_offsets(void)

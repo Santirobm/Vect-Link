@@ -1,4 +1,20 @@
 #include "vectlink/checksum.h"
+#include "integrity/crc32c_internal.h"
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#define VTLK_CRC_ARCH_X86 1
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__GNUC__) || defined(__clang__)
+#include <cpuid.h>
+#endif
+#else
+#define VTLK_CRC_ARCH_X86 0
+#endif
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 /*
  * Reflected Castagnoli CRC32C lookup table (polynomial 0x82F63B78).
@@ -71,7 +87,7 @@ static const uint32_t vtlk_crc32c_table[256] = {
     0xBE2DA0A5u, 0x4C4623A6u, 0x5F16D052u, 0xAD7D5351u
 };
 
-uint32_t vtlk_crc32c_update(uint32_t crc, const void *data, size_t len)
+uint32_t vtlk_crc32c_scalar_update(uint32_t crc, const void *data, size_t len)
 {
     const uint8_t *bytes = (const uint8_t *)data;
     size_t i;
@@ -85,6 +101,82 @@ uint32_t vtlk_crc32c_update(uint32_t crc, const void *data, size_t len)
         crc = vtlk_crc32c_table[(crc ^ bytes[i]) & 0xFFu] ^ (crc >> 8);
     }
     return ~crc;
+}
+
+uint32_t vtlk_crc32c_scalar(const void *data, size_t len)
+{
+    return vtlk_crc32c_scalar_update(0u, data, len);
+}
+
+static int vtlk_cpu_supports_sse42(void)
+{
+#if !VTLK_CRC_ARCH_X86
+    return 0;
+#elif defined(_MSC_VER)
+    int info[4];
+    __cpuidex(info, 0, 0);
+    if (info[0] < 1) {
+        return 0;
+    }
+    __cpuidex(info, 1, 0);
+    return ((info[2] & (1 << 20)) != 0) ? 1 : 0;
+#elif defined(__GNUC__) || defined(__clang__)
+    unsigned int eax = 0u;
+    unsigned int ebx = 0u;
+    unsigned int ecx = 0u;
+    unsigned int edx = 0u;
+    if (__get_cpuid_max(0u, NULL) < 1u) {
+        return 0;
+    }
+    if (!__get_cpuid(1u, &eax, &ebx, &ecx, &edx)) {
+        return 0;
+    }
+    return ((ecx & (1u << 20)) != 0u) ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+/* 0 = unresolved, 1 = scalar, 2 = sse42 */
+#if defined(_MSC_VER)
+static long g_sse42_state = 0L;
+#else
+static int g_sse42_state = 0;
+#endif
+
+static int vtlk_crc32c_resolve_state(void)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    int state = __atomic_load_n(&g_sse42_state, __ATOMIC_ACQUIRE);
+    if (state == 0) {
+        state = vtlk_cpu_supports_sse42() ? 2 : 1;
+        __atomic_store_n(&g_sse42_state, state, __ATOMIC_RELEASE);
+    }
+    return state;
+#elif defined(_MSC_VER)
+    long state = _InterlockedCompareExchange(&g_sse42_state, 0L, 0L);
+    if (state == 0L) {
+        long resolved = vtlk_cpu_supports_sse42() ? 2L : 1L;
+        _InterlockedCompareExchange(&g_sse42_state, resolved, 0L);
+        state = _InterlockedCompareExchange(&g_sse42_state, 0L, 0L);
+    }
+    return (int)state;
+#else
+    if (g_sse42_state == 0) {
+        g_sse42_state = vtlk_cpu_supports_sse42() ? 2 : 1;
+    }
+    return g_sse42_state;
+#endif
+}
+
+uint32_t vtlk_crc32c_update(uint32_t crc, const void *data, size_t len)
+{
+#if VTLK_CRC_ARCH_X86
+    if (vtlk_crc32c_resolve_state() == 2) {
+        return vtlk_crc32c_sse42_update(crc, data, len);
+    }
+#endif
+    return vtlk_crc32c_scalar_update(crc, data, len);
 }
 
 uint32_t vtlk_crc32c(const void *data, size_t len)

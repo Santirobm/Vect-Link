@@ -4,6 +4,7 @@ build-*/
 cmake-build-*/
 out/
 benchmark_results.csv
+llama_handoff_benchmark.csv
 ref_embd.bin
 
 # Binaries & artifacts

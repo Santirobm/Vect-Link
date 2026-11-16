@@ -18,13 +18,16 @@ set(VECTLINK_SOURCES
 )
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|amd64|x86_64|X86_64|i686|x86")
-    list(APPEND VECTLINK_SOURCES src/codec/int4_avx2.c)
+    list(APPEND VECTLINK_SOURCES src/codec/int4_avx2.c src/integrity/crc32c_sse42.c)
     if(NOT VTLK_DISABLE_AVX2)
         if(MSVC)
             set_source_files_properties(src/codec/int4_avx2.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
         else()
             set_source_files_properties(src/codec/int4_avx2.c PROPERTIES COMPILE_OPTIONS "-mavx2")
         endif()
+    endif()
+    if(NOT MSVC)
+        set_source_files_properties(src/integrity/crc32c_sse42.c PROPERTIES COMPILE_OPTIONS "-msse4.2")
     endif()
 endif()
 
@@ -75,6 +78,7 @@ endfunction()
 
 enable_testing()
 vectlink_add_test(test_protocol tests/test_protocol.c)
+target_include_directories(test_protocol PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 vectlink_add_test(test_ring_buffer tests/test_ring_buffer.c)
 vectlink_add_test(test_cross_process tests/test_cross_process.c)
 vectlink_add_test(test_codec tests/test_codec.c)
@@ -159,7 +163,7 @@ if(VTLK_BUILD_LLAMA_BRIDGE)
         list(APPEND VTLK_LLAMA_INCLUDES "${GGML_INCLUDE_DIR}")
     endif()
 
-    foreach(llama_target llama_agent_a llama_agent_b)
+    foreach(llama_target llama_agent_a llama_agent_b benchmark_llama_handoff)
         add_executable(${llama_target} examples/${llama_target}.c)
         # llama.h and ggml.h use C11 features (_Noreturn, typedef redefs, anonymous unions)
         set_target_properties(${llama_target} PROPERTIES
@@ -169,6 +173,7 @@ if(VTLK_BUILD_LLAMA_BRIDGE)
         )
         target_include_directories(${llama_target} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
             ${VTLK_LLAMA_INCLUDES}
         )
         target_link_libraries(${llama_target} PRIVATE vectlink "${LLAMA_LIBRARY}")

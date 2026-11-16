@@ -178,3 +178,26 @@ To measure end-to-end cosine similarity between the original FP32 embeddings in 
 3. `(header.flags & VTLK_FLAG_KV_STATE)` matches its own `--mode` (`embd` vs `kv-state`)
 
 Mismatched models or mismatched `--mode` flags are rejected explicitly before touching `llama_decode` or `llama_state_seq_set_data`.
+
+---
+
+## 8. Handoff Benchmark (`benchmark_llama_handoff`)
+
+Compare Receiver **Time-To-First-Token (`TTFT`)** and total handoff latency across three scenarios on an exact `512`-token technical prompt (`n_ctx = 1024`, `n_batch = 512`, `threads = 4`, `warmup = 2`, `iters = 10`):
+
+```powershell
+$env:PATH = "C:\msys64\clang64\bin;C:\Users\sgi.lm\Desktop\llama.cpp\build\bin;" + $env:PATH
+.\build-llama\benchmark_llama_handoff.exe `
+  --model C:\Users\sgi.lm\Desktop\models\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  --tokens 512 --threads 4 --iters 10
+```
+
+Measured locally on Windows (`Clang 22.1.8 -O3`, `qwen2.5-0.5b-instruct-q4_k_m.gguf`):
+
+| Scenario | Payload (Bytes) | Sender p50 (us) | Receiver TTFT p50 (us) | Total Handoff p50 (us) | Speedup vs Re-Prefill | Top-1 Match |
+| :--- | ---: | ---: | ---: | ---: | ---: | :--- |
+| **Text Re-Prefill (no state)** | 2,871 | 0.00 | 1,449,826.80 | 1,449,826.80 | 1.00x | EXACT (`3175`) |
+| **KV-Cache Disk (`stdio`)** | 6,298,208 | 2,902.00 | 26,867.20 | 29,648.40 | 48.90x | EXACT (`3175`) |
+| **Vect-Link SHM (`KV_RAW`)** | 6,298,224 | 3,484.10 | **26,122.30** | **29,660.70** | **48.88x** | **EXACT (`3175`)** |
+
+*(Note: Exports `llama_handoff_benchmark.csv` in the working directory. `Vect-Link SHM (KV_RAW)` uses runtime CPUID-dispatched hardware **SSE4.2 CRC32C** over the 6.3 MB payload on both push and pop plus compatibility hash validation, matching buffered RAM page-cache `stdio` latency while providing full end-to-end integrity and exact Top-1 greedy token parity with 512-token re-prefill.)*

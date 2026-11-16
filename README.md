@@ -8,7 +8,7 @@ Zero-dependency **C99** binary protocol, quantization codecs, and lock-free shar
 - **Lock-Free SPSC Ring Buffer over OS Shared Memory:** Cache-line-isolated 192B control block with acquire/release atomic barriers (`CreateFileMappingA`/`MapViewOfFile` on Windows, `shm_open`/`mmap` on POSIX).
 - **Portable FP16 / INT4_BLOCK Codecs with Runtime AVX2 Dispatch:** Branchless `libm`-free C99 scalar fast-path plus translation-unit-isolated AVX2 acceleration (`src/codec/int4_avx2.c`) dispatched dynamically via `CPUID + XGETBV`, deterministic non-finite (`NaN`/`Inf`) sanitization, and bit-exact scalar/AVX2 parity.
 - **Real Multi-Process `llama.cpp` IPC Bridge (optional PoC):** Connects two independent `llama.cpp` processes over Vect-Link SHM with strict GGUF weight/metadata & KV-layout compatibility hashing ([examples/README_LLAMA.md](examples/README_LLAMA.md)):
-  - **`--mode kv-state`** (coherent continuation via sequence KV-Cache state transfer): `135,908 B` state + `16 B` `vtlk_llama_kv_meta_t`, **`338.20 us`–`343.30 us`** extract+push, coherent continuation without repeating prompt prefill on `qwen2.5-0.5b-instruct-q4_k_m.gguf`.
+  - **`--mode kv-state`** (coherent continuation via sequence KV-Cache state transfer): `135,908 B` state + `16 B` `vtlk_llama_kv_meta_t`, **`338.20 us`–`343.30 us`** extract+push, coherent continuation without repeating prompt prefill on `qwen2.5-0.5b-instruct-q4_k_m.gguf`. On a `512`-token context handoff (`6.3 MB` KV state), `benchmark_llama_handoff` achieves **`26.12 ms`** Receiver TTFT (**`48.88x`** speedup vs `1,449.83 ms` Text Re-Prefill) with exact Top-1 token parity.
   - **`--mode embd`** (INT4-quantized tensor transport & reconstruction benchmark): `11 x 896` FP32 -> `5,544 B` INT4 (**`7.11x`** compression), **`~44 us`** combined encode+push+pop+decode (`28.80 us` + `15.40 us`), **`0.985879`** cosine similarity *(demonstrates Layer-N post-RMSNorm vs Layer-0 `batch.embd` alignment requirement)*.
 
 ## Baseline Benchmarks (`v0.8.0` / `v0.5.1`)
@@ -32,7 +32,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build &
 ## Architecture (`v0.1.0` – `v0.8.5+`)
 
 - **Wire Format (`v0.1.0`+):** Fixed 64-byte `VTLK` header serialized via explicit little-endian offsets (zero struct-packing assumptions, zero dynamic allocations), supporting `VTLK_QUANT_FP16`, `VTLK_QUANT_INT4_BLOCK`, `VTLK_QUANT_RVQ10`, and `VTLK_QUANT_RAW`.
-- **Integrity (`v0.2.0`):** Portable Castagnoli **CRC32C** (`0x82F63B78`) over both header bytes `[0..59]` (`header_crc32c`) and payload (`payload_crc32c`).
+- **Integrity (`v0.2.0`+):** Castagnoli **CRC32C** (`0x82F63B78`) over both header bytes `[0..59]` (`header_crc32c`) and payload (`payload_crc32c`), with runtime `CPUID`-dispatched hardware **SSE4.2** acceleration (`src/integrity/crc32c_sse42.c`) and portable C99 scalar fallback.
 - **IPC Transport (`v0.3.0`):** Lock-free **SPSC Ring Buffer** over OS shared memory (`CreateFileMappingA`/`MapViewOfFile` on Windows, `shm_open`/`mmap` on POSIX) with 192-byte cache-line-isolated control block and acquire/release atomic barriers.
 - **Tensor Codecs (`v0.4.0`–`v0.8.1`):** Portable IEEE 754 **FP16** (`2.0x`) and 32-element block-quantized **INT4_BLOCK** (`7.11x`, 18 bytes/block) with `libm`-free C99 scalar fast-path, `NaN`/`Inf` sanitization, and runtime **`CPUID + XGETBV` AVX2 dispatch** isolated in `src/codec/int4_avx2.c` (`-DVTLK_DISABLE_AVX2=ON` forces scalar fallback cleanly).
 - **Verification:** Compiled with `-std=c99 -Wall -Wextra -Werror -pedantic` (GCC/Clang) and `/TC /W4 /WX` (MSVC), tested on Windows + Linux with AddressSanitizer + UndefinedBehaviorSanitizer (`-fsanitize=address,undefined`).
@@ -47,7 +47,7 @@ include/vectlink/
   codec.h         # FP16 & INT4_BLOCK tensor codecs + cosine similarity metrics
   transport.h     # Lock-free SPSC ring buffer & OS shared memory API
 src/
-  integrity/      # crc32c.c
+  integrity/      # crc32c.c, crc32c_sse42.c, crc32c_internal.h
   protocol/       # endian.h, header.c
   codec/          # fp16.c, int4.c, int4_avx2.c, codec.c
   transport/      # atomic_compat.h, ring_buffer.c, shm_windows.c, shm_posix.c
@@ -66,6 +66,7 @@ examples/
   llama_bridge_common.h
   llama_agent_a.c
   llama_agent_b.c
+  benchmark_llama_handoff.c
   README_LLAMA.md
 ```
 
