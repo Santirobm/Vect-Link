@@ -108,11 +108,10 @@ uint32_t vtlk_crc32c_scalar(const void *data, size_t len)
     return vtlk_crc32c_scalar_update(0u, data, len);
 }
 
+#if VTLK_CRC_ARCH_X86
 static int vtlk_cpu_supports_sse42(void)
 {
-#if !VTLK_CRC_ARCH_X86
-    return 0;
-#elif defined(_MSC_VER)
+#if defined(_MSC_VER)
     int info[4];
     __cpuidex(info, 0, 0);
     if (info[0] < 1) {
@@ -168,6 +167,7 @@ static int vtlk_crc32c_resolve_state(void)
     return g_sse42_state;
 #endif
 }
+#endif /* VTLK_CRC_ARCH_X86 */
 
 uint32_t vtlk_crc32c_update(uint32_t crc, const void *data, size_t len)
 {
