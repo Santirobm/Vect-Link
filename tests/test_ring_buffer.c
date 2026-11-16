@@ -174,11 +174,81 @@ static void test_payload_corruption_detection(void)
     test_free_aligned64(raw);
 }
 
+static void test_zero_copy_slot_loan(void)
+{
+    uint8_t *arena;
+    vtlk_ring_t prod;
+    vtlk_ring_t cons;
+    size_t req;
+    vtlk_write_slot_t wslot;
+    vtlk_write_slot_t wslot2;
+    vtlk_read_slot_t rslot;
+    vtlk_read_slot_t rslot2;
+    vtlk_header_t h_tmpl;
+    uint32_t i;
+
+    req = vtlk_ring_required_bytes(4u, 256u, NULL);
+    assert(req > 0u);
+    arena = (uint8_t *)test_alloc_aligned64(req);
+    assert(arena != NULL);
+
+    assert(vtlk_ring_init(&prod, arena, req, 4u, 256u) == VTLK_OK);
+    assert(vtlk_ring_attach(&cons, arena, req) == VTLK_OK);
+
+    /* Acquire read on empty ring returns VTLK_ERR_EMPTY */
+    assert(vtlk_ring_acquire_read(&cons, &rslot) == (int)VTLK_ERR_EMPTY);
+
+    /* Acquire write, verify 64B payload alignment, verify double acquire returns VTLK_ERR_BUSY */
+    assert(vtlk_ring_acquire_write(&prod, &wslot) == (int)VTLK_OK);
+    assert(((uintptr_t)wslot.payload % 64u) == 0u);
+    assert(wslot.capacity == 256u);
+    assert(vtlk_ring_acquire_write(&prod, &wslot2) == (int)VTLK_ERR_BUSY);
+
+    /* Abort leaves ring empty and frees producer slot loan */
+    assert(vtlk_ring_abort_write(&prod, &wslot) == (int)VTLK_OK);
+    assert(vtlk_ring_acquire_read(&cons, &rslot) == (int)VTLK_ERR_EMPTY);
+
+    /* Re-acquire, write directly into SHM payload, commit */
+    assert(vtlk_ring_acquire_write(&prod, &wslot) == (int)VTLK_OK);
+    memset(wslot.payload, 0x5Au, 128u);
+    make_header(&h_tmpl, 42u, 128u);
+    assert(vtlk_ring_commit_write(&prod, &wslot, &h_tmpl, 128u) == (int)VTLK_OK);
+
+    /* Acquire read, verify BUSY on second acquire_read, verify header & direct payload, release */
+    assert(vtlk_ring_acquire_read(&cons, &rslot) == (int)VTLK_OK);
+    assert(vtlk_ring_acquire_read(&cons, &rslot2) == (int)VTLK_ERR_BUSY);
+    assert(rslot.header.sequence == 42u);
+    assert(rslot.bytes == 128u);
+    assert(((const uint8_t *)rslot.payload)[0] == 0x5Au);
+    assert(((const uint8_t *)rslot.payload)[127] == 0x5Au);
+    assert(vtlk_ring_release_read(&cons, &rslot) == (int)VTLK_OK);
+    assert(vtlk_ring_acquire_read(&cons, &rslot) == (int)VTLK_ERR_EMPTY);
+
+    /* Wrap-around stress with zero-copy slot loan */
+    for (i = 0u; i < 32u; ++i) {
+        size_t sz = (size_t)((i % 200u) + 1u);
+        assert(vtlk_ring_acquire_write(&prod, &wslot) == (int)VTLK_OK);
+        memset(wslot.payload, (int)(i & 0xFFu), sz);
+        make_header(&h_tmpl, 500u + (uint64_t)i, (uint32_t)sz);
+        assert(vtlk_ring_commit_write(&prod, &wslot, &h_tmpl, sz) == (int)VTLK_OK);
+
+        assert(vtlk_ring_acquire_read(&cons, &rslot) == (int)VTLK_OK);
+        assert(rslot.header.sequence == 500u + (uint64_t)i);
+        assert(rslot.bytes == sz);
+        assert(((const uint8_t *)rslot.payload)[0] == (uint8_t)(i & 0xFFu));
+        assert(((const uint8_t *)rslot.payload)[sz - 1u] == (uint8_t)(i & 0xFFu));
+        assert(vtlk_ring_release_read(&cons, &rslot) == (int)VTLK_OK);
+    }
+
+    test_free_aligned64(arena);
+}
+
 int main(void)
 {
     test_required_bytes_and_init();
     test_fifo_full_empty_wraparound();
     test_payload_corruption_detection();
+    test_zero_copy_slot_loan();
 
     printf("All Vect-Link ring buffer tests passed.\n");
     return 0;

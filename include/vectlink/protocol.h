@@ -29,7 +29,8 @@ typedef enum vtlk_status {
     VTLK_ERR_INVALID_ARG = -7,
     VTLK_ERR_FULL = -8,
     VTLK_ERR_EMPTY = -9,
-    VTLK_ERR_SHM = -10
+    VTLK_ERR_SHM = -10,
+    VTLK_ERR_BUSY = -11
 } vtlk_status_t;
 
 typedef enum vtlk_quant_scheme {

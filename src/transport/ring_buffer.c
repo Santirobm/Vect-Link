@@ -115,6 +115,12 @@ vtlk_status_t vtlk_ring_init(vtlk_ring_t *ring,
     ring->max_payload_bytes = max_payload_bytes;
     ring->cached_read_seq = 0u;
     ring->cached_write_seq = 0u;
+    ring->write_in_flight = 0;
+    ring->write_slot_index = 0u;
+    ring->write_seq_pending = 0u;
+    ring->read_in_flight = 0;
+    ring->read_slot_index = 0u;
+    ring->read_seq_pending = 0u;
 
     vtlk_atomic_store_release_u64(vtlk_ctrl_write_seq_ptr(ring), 0u);
     vtlk_atomic_store_release_u64(vtlk_ctrl_read_seq_ptr(ring), 0u);
@@ -174,6 +180,12 @@ vtlk_status_t vtlk_ring_attach(vtlk_ring_t *ring,
     ring->max_payload_bytes = max_payload;
     ring->cached_read_seq = vtlk_atomic_load_acquire_u64(vtlk_ctrl_read_seq_cptr(ring));
     ring->cached_write_seq = vtlk_atomic_load_acquire_u64(vtlk_ctrl_write_seq_cptr(ring));
+    ring->write_in_flight = 0;
+    ring->write_slot_index = 0u;
+    ring->write_seq_pending = 0u;
+    ring->read_in_flight = 0;
+    ring->read_slot_index = 0u;
+    ring->read_seq_pending = 0u;
 
     return VTLK_OK;
 }
@@ -193,6 +205,12 @@ vtlk_status_t vtlk_ring_push(vtlk_ring_t *ring,
     }
     if (ring->base == NULL) {
         return VTLK_ERR_INVALID_PARAM;
+    }
+    if (ring->read_in_flight != 0) {
+        return VTLK_ERR_BUSY;
+    }
+    if (ring->write_in_flight != 0) {
+        return VTLK_ERR_BUSY;
     }
     if (hdr->payload_bytes > ring->max_payload_bytes) {
         return VTLK_ERR_INVALID_PARAM;
@@ -248,6 +266,12 @@ vtlk_status_t vtlk_ring_pop(vtlk_ring_t *ring,
     if (ring->base == NULL) {
         return VTLK_ERR_INVALID_PARAM;
     }
+    if (ring->read_in_flight != 0) {
+        return VTLK_ERR_BUSY;
+    }
+    if (ring->write_in_flight != 0) {
+        return VTLK_ERR_BUSY;
+    }
 
     read_seq = vtlk_atomic_load_acquire_u64(vtlk_ctrl_read_seq_cptr(ring));
     if (ring->cached_write_seq == read_seq) {
@@ -286,4 +310,168 @@ vtlk_status_t vtlk_ring_pop(vtlk_ring_t *ring,
     *hdr_out = tmp_hdr;
     vtlk_atomic_store_release_u64(vtlk_ctrl_read_seq_ptr(ring), read_seq + 1u);
     return VTLK_OK;
+}
+
+int vtlk_ring_acquire_write(vtlk_ring_t *ring, vtlk_write_slot_t *out_slot)
+{
+    uint64_t write_seq;
+    uint32_t slot_idx;
+    uint8_t *slot;
+
+    if (ring == NULL || out_slot == NULL) {
+        return (int)VTLK_ERR_NULL_PTR;
+    }
+    if (ring->base == NULL || ring->capacity == 0u) {
+        return (int)VTLK_ERR_INVALID_PARAM;
+    }
+    if (ring->write_in_flight != 0) {
+        return (int)VTLK_ERR_BUSY;
+    }
+
+    write_seq = vtlk_atomic_load_acquire_u64(vtlk_ctrl_write_seq_cptr(ring));
+    if ((write_seq - ring->cached_read_seq) >= (uint64_t)ring->capacity) {
+        ring->cached_read_seq = vtlk_atomic_load_acquire_u64(vtlk_ctrl_read_seq_cptr(ring));
+        if ((write_seq - ring->cached_read_seq) >= (uint64_t)ring->capacity) {
+            return (int)VTLK_ERR_FULL;
+        }
+    }
+
+    slot_idx = (uint32_t)(write_seq & (uint64_t)(ring->capacity - 1u));
+    slot = ring->base + VTLK_RING_CTRL_SIZE + (size_t)slot_idx * (size_t)ring->slot_size;
+
+    ring->write_in_flight = 1;
+    ring->write_slot_index = slot_idx;
+    ring->write_seq_pending = write_seq;
+
+    out_slot->payload = (void *)(slot + VTLK_HEADER_SIZE);
+    out_slot->capacity = (size_t)ring->max_payload_bytes;
+    out_slot->slot_index = slot_idx;
+    return (int)VTLK_OK;
+}
+
+int vtlk_ring_commit_write(vtlk_ring_t *ring,
+                           const vtlk_write_slot_t *slot,
+                           const vtlk_header_t *hdr_template,
+                           size_t payload_bytes)
+{
+    uint8_t *slot_ptr;
+    vtlk_header_t local_hdr;
+    vtlk_status_t st;
+
+    if (ring == NULL || slot == NULL || hdr_template == NULL) {
+        return (int)VTLK_ERR_NULL_PTR;
+    }
+    if (ring->base == NULL || ring->write_in_flight == 0 ||
+        slot->slot_index != ring->write_slot_index) {
+        return (int)VTLK_ERR_INVALID_PARAM;
+    }
+    if (payload_bytes > (size_t)ring->max_payload_bytes) {
+        return (int)VTLK_ERR_INVALID_PARAM;
+    }
+
+    slot_ptr = ring->base + VTLK_RING_CTRL_SIZE + (size_t)slot->slot_index * (size_t)ring->slot_size;
+    if (slot->payload != (const void *)(slot_ptr + VTLK_HEADER_SIZE)) {
+        return (int)VTLK_ERR_INVALID_PARAM;
+    }
+
+    local_hdr = *hdr_template;
+    local_hdr.payload_bytes = (uint32_t)payload_bytes;
+    local_hdr.payload_crc32c = (payload_bytes > 0u)
+                                   ? vtlk_crc32c(slot->payload, payload_bytes)
+                                   : 0u;
+
+    st = vtlk_header_encode(&local_hdr, slot_ptr, VTLK_HEADER_SIZE);
+    if (st != VTLK_OK) {
+        return (int)st;
+    }
+
+    vtlk_atomic_store_release_u64(vtlk_ctrl_write_seq_ptr(ring), ring->write_seq_pending + 1u);
+    ring->write_in_flight = 0;
+    return (int)VTLK_OK;
+}
+
+int vtlk_ring_abort_write(vtlk_ring_t *ring, const vtlk_write_slot_t *slot)
+{
+    if (ring == NULL || slot == NULL) {
+        return (int)VTLK_ERR_NULL_PTR;
+    }
+    if (ring->base == NULL || ring->write_in_flight == 0 ||
+        slot->slot_index != ring->write_slot_index) {
+        return (int)VTLK_ERR_INVALID_PARAM;
+    }
+
+    ring->write_in_flight = 0;
+    return (int)VTLK_OK;
+}
+
+int vtlk_ring_acquire_read(vtlk_ring_t *ring, vtlk_read_slot_t *out_slot)
+{
+    uint64_t read_seq;
+    uint32_t slot_idx;
+    const uint8_t *slot;
+    vtlk_header_t tmp_hdr;
+    vtlk_status_t st;
+    uint32_t actual_crc;
+
+    if (ring == NULL || out_slot == NULL) {
+        return (int)VTLK_ERR_NULL_PTR;
+    }
+    if (ring->base == NULL || ring->capacity == 0u) {
+        return (int)VTLK_ERR_INVALID_PARAM;
+    }
+    if (ring->read_in_flight != 0) {
+        return (int)VTLK_ERR_BUSY;
+    }
+
+    read_seq = vtlk_atomic_load_acquire_u64(vtlk_ctrl_read_seq_cptr(ring));
+    if (ring->cached_write_seq == read_seq) {
+        ring->cached_write_seq = vtlk_atomic_load_acquire_u64(vtlk_ctrl_write_seq_cptr(ring));
+        if (ring->cached_write_seq == read_seq) {
+            return (int)VTLK_ERR_EMPTY;
+        }
+    }
+
+    slot_idx = (uint32_t)(read_seq & (uint64_t)(ring->capacity - 1u));
+    slot = ring->base + VTLK_RING_CTRL_SIZE + (size_t)slot_idx * (size_t)ring->slot_size;
+
+    st = vtlk_header_decode(slot, VTLK_HEADER_SIZE, &tmp_hdr);
+    if (st != VTLK_OK) {
+        return (int)st;
+    }
+
+    if (tmp_hdr.payload_bytes > ring->max_payload_bytes) {
+        return (int)VTLK_ERR_INVALID_PARAM;
+    }
+
+    if (tmp_hdr.payload_bytes > 0u) {
+        actual_crc = vtlk_crc32c(slot + VTLK_HEADER_SIZE, tmp_hdr.payload_bytes);
+        if (actual_crc != tmp_hdr.payload_crc32c) {
+            return (int)VTLK_ERR_CRC_MISMATCH;
+        }
+    }
+
+    out_slot->header = tmp_hdr;
+    out_slot->payload = (const void *)(slot + VTLK_HEADER_SIZE);
+    out_slot->bytes = (size_t)tmp_hdr.payload_bytes;
+    out_slot->slot_index = slot_idx;
+
+    ring->read_in_flight = 1;
+    ring->read_slot_index = slot_idx;
+    ring->read_seq_pending = read_seq;
+    return (int)VTLK_OK;
+}
+
+int vtlk_ring_release_read(vtlk_ring_t *ring, const vtlk_read_slot_t *slot)
+{
+    if (ring == NULL || slot == NULL) {
+        return (int)VTLK_ERR_NULL_PTR;
+    }
+    if (ring->base == NULL || ring->read_in_flight == 0 ||
+        slot->slot_index != ring->read_slot_index) {
+        return (int)VTLK_ERR_INVALID_PARAM;
+    }
+
+    vtlk_atomic_store_release_u64(vtlk_ctrl_read_seq_ptr(ring), ring->read_seq_pending + 1u);
+    ring->read_in_flight = 0;
+    return (int)VTLK_OK;
 }

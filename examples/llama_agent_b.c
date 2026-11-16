@@ -143,12 +143,15 @@ int main(int argc, char **argv)
 
     vtlk_shm_t shm;
     vtlk_ring_t ring;
+    vtlk_read_slot_t rslot;
     vtlk_header_t hdr;
-    uint8_t *rx_payload = NULL;
     float *decoded = NULL;
     size_t rx_cap = MAX_SHM_MAP_BYTES;
     size_t total_elems = 0u;
     vtlk_status_t st;
+    int rc_slot;
+    int shm_open_flag = 0;
+    int slot_acquired = 0;
     int retries;
     uint64_t t0;
     uint64_t t1;
@@ -248,31 +251,25 @@ int main(int argc, char **argv)
             vtlk_shm_close(&shm);
             goto cleanup;
         }
-    }
-
-    rx_payload = (uint8_t *)malloc(ring.max_payload_bytes);
-    if (rx_payload == NULL) {
-        fprintf(stderr, "llama_agent_b: OOM allocating rx_payload\n");
-        vtlk_shm_close(&shm);
-        goto cleanup;
+        shm_open_flag = 1;
     }
 
     for (;;) {
         t_pop0 = vtlk_llama_now_ns();
-        st = vtlk_ring_pop(&ring, &hdr, rx_payload, ring.max_payload_bytes);
-        if (st == VTLK_OK) {
+        rc_slot = vtlk_ring_acquire_read(&ring, &rslot);
+        if (rc_slot == (int)VTLK_OK) {
             t_pop1 = vtlk_llama_now_ns();
+            slot_acquired = 1;
             break;
         }
-        if (st == VTLK_ERR_EMPTY) {
+        if (rc_slot == (int)VTLK_ERR_EMPTY) {
             vtlk_llama_cpu_yield();
             continue;
         }
-        fprintf(stderr, "llama_agent_b: vtlk_ring_pop failed (%d)\n", (int)st);
-        vtlk_shm_close(&shm);
+        fprintf(stderr, "llama_agent_b: vtlk_ring_acquire_read failed (%d)\n", rc_slot);
         goto cleanup;
     }
-    vtlk_shm_close(&shm);
+    hdr = rslot.header;
 
     {
         int pkt_is_kv = ((hdr.flags & VTLK_FLAG_KV_STATE) != 0u);
@@ -323,11 +320,15 @@ int main(int argc, char **argv)
         }
 
         t0 = vtlk_llama_now_ns();
-        st = vtlk_decode_tensor(rx_payload, hdr.payload_bytes,
+        st = vtlk_decode_tensor(rslot.payload, rslot.bytes,
                                 hdr.n_tokens, hdr.d_model,
                                 (vtlk_quant_scheme_t)hdr.quant_scheme,
                                 decoded, total_elems);
         t1 = vtlk_llama_now_ns();
+        (void)vtlk_ring_release_read(&ring, &rslot);
+        slot_acquired = 0;
+        vtlk_shm_close(&shm);
+        shm_open_flag = 0;
         if (st != VTLK_OK) {
             fprintf(stderr, "llama_agent_b: vtlk_decode_tensor failed (%d)\n", (int)st);
             goto cleanup;
@@ -390,7 +391,7 @@ int main(int argc, char **argv)
             goto cleanup;
         }
 
-        vtlk_llama_kv_meta_decode(rx_payload, &kv_meta);
+        vtlk_llama_kv_meta_decode((const uint8_t *)rslot.payload, &kv_meta);
         if (kv_meta.magic != VTLK_LLAMA_KV_META_MAGIC) {
             fprintf(stderr,
                     "[Agent B] REJECTED invalid kv_meta magic=0x%08x\n",
@@ -404,18 +405,22 @@ int main(int argc, char **argv)
             goto cleanup;
         }
         if (kv_meta.raw_state_bytes == 0u ||
-            (size_t)hdr.payload_bytes != sizeof(vtlk_llama_kv_meta_t) + (size_t)kv_meta.raw_state_bytes) {
+            rslot.bytes != sizeof(vtlk_llama_kv_meta_t) + (size_t)kv_meta.raw_state_bytes) {
             fprintf(stderr,
-                    "[Agent B] REJECTED kv-state size mismatch: payload=%u B, expected %zu B\n",
-                    hdr.payload_bytes,
+                    "[Agent B] REJECTED kv-state size mismatch: payload=%zu B, expected %zu B\n",
+                    rslot.bytes,
                     sizeof(vtlk_llama_kv_meta_t) + (size_t)kv_meta.raw_state_bytes);
             goto cleanup;
         }
 
-        raw_state_ptr = rx_payload + VTLK_LLAMA_KV_META_SIZE;
+        raw_state_ptr = (const uint8_t *)rslot.payload + VTLK_LLAMA_KV_META_SIZE;
         t_set0 = vtlk_llama_now_ns();
         restored = llama_state_seq_set_data(ctx, raw_state_ptr, (size_t)kv_meta.raw_state_bytes, 0);
         t_set1 = vtlk_llama_now_ns();
+        (void)vtlk_ring_release_read(&ring, &rslot);
+        slot_acquired = 0;
+        vtlk_shm_close(&shm);
+        shm_open_flag = 0;
         if (restored == 0u || restored != (size_t)kv_meta.raw_state_bytes) {
             fprintf(stderr,
                     "llama_agent_b: llama_state_seq_set_data restored %zu B != expected %u B\n",
@@ -496,11 +501,16 @@ int main(int argc, char **argv)
     rc = 0;
 
 cleanup:
+    if (slot_acquired) {
+        (void)vtlk_ring_release_read(&ring, &rslot);
+    }
+    if (shm_open_flag) {
+        vtlk_shm_close(&shm);
+    }
     if (smpl != NULL) {
         llama_sampler_free(smpl);
     }
     free(decoded);
-    free(rx_payload);
     if (ctx != NULL) {
         llama_free(ctx);
     }

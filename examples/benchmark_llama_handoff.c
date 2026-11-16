@@ -222,8 +222,6 @@ int main(int argc, char **argv)
 
     uint8_t *disk_tx_buf = NULL;
     uint8_t *disk_rx_buf = NULL;
-    uint8_t *vtlk_tx_buf = NULL;
-    uint8_t *vtlk_rx_buf = NULL;
 
     uint64_t *s_samples = NULL;
     uint64_t *r_samples = NULL;
@@ -345,12 +343,10 @@ int main(int argc, char **argv)
 
     disk_tx_buf = (uint8_t *)malloc(state_size);
     disk_rx_buf = (uint8_t *)malloc(state_size);
-    vtlk_tx_buf = (uint8_t *)malloc(max_payload_bytes);
-    vtlk_rx_buf = (uint8_t *)malloc(max_payload_bytes);
     s_samples = (uint64_t *)malloc((size_t)iters * sizeof(uint64_t));
     r_samples = (uint64_t *)malloc((size_t)iters * sizeof(uint64_t));
     t_samples = (uint64_t *)malloc((size_t)iters * sizeof(uint64_t));
-    if (!disk_tx_buf || !disk_rx_buf || !vtlk_tx_buf || !vtlk_rx_buf ||
+    if (!disk_tx_buf || !disk_rx_buf ||
         !s_samples || !r_samples || !t_samples) {
         fprintf(stderr, "benchmark_llama_handoff: OOM\n");
         goto cleanup;
@@ -445,33 +441,41 @@ int main(int argc, char **argv)
         results[1].top1_match = match_disk;
     }
 
-    /* Scenario 3: Vect-Link (VTLK_QUANT_RAW + SPSC SHM + CRC32C) */
+    /* Scenario 3: Vect-Link True Zero-Copy (VTLK_QUANT_RAW + SPSC SHM + CRC32C) */
     {
         size_t vtlk_payload_bytes = 0u;
         llama_token tok_vtlk = 0;
         int match_vtlk = 1;
         for (run = 0u; run < warmup + iters; ++run) {
             uint64_t ts0, ts1, tr0, tr1;
-            size_t state_cap = max_payload_bytes - (size_t)VTLK_LLAMA_KV_META_SIZE;
+            vtlk_write_slot_t wslot;
+            vtlk_read_slot_t rslot;
+            uint8_t *wbytes;
+            size_t state_cap;
             size_t state_written;
             vtlk_llama_kv_meta_t tx_meta;
             vtlk_llama_kv_meta_t rx_meta;
             vtlk_header_t tx_hdr;
-            vtlk_header_t rx_hdr;
 
             llama_memory_clear(llama_get_memory(ctx_b), true);
 
             ts0 = vtlk_bench_now_ns();
+            if (vtlk_ring_acquire_write(&ring_a, &wslot) != (int)VTLK_OK) {
+                goto cleanup;
+            }
+            wbytes = (uint8_t *)wslot.payload;
+            state_cap = wslot.capacity - (size_t)VTLK_LLAMA_KV_META_SIZE;
             state_written = llama_state_seq_get_data(
-                ctx_a, vtlk_tx_buf + VTLK_LLAMA_KV_META_SIZE, state_cap, 0);
+                ctx_a, wbytes + VTLK_LLAMA_KV_META_SIZE, state_cap, 0);
             if (state_written == 0u || state_written > state_cap) {
+                (void)vtlk_ring_abort_write(&ring_a, &wslot);
                 goto cleanup;
             }
             tx_meta.magic = VTLK_LLAMA_KV_META_MAGIC;
             tx_meta.llama_build = local_build;
             tx_meta.last_token_id = (int32_t)tokens[n_tokens - 1u];
             tx_meta.raw_state_bytes = (uint32_t)state_written;
-            vtlk_llama_kv_meta_encode(&tx_meta, vtlk_tx_buf);
+            vtlk_llama_kv_meta_encode(&tx_meta, wbytes);
 
             vtlk_payload_bytes = (size_t)VTLK_LLAMA_KV_META_SIZE + state_written;
             vtlk_header_init_defaults(&tx_hdr);
@@ -482,38 +486,44 @@ int main(int argc, char **argv)
             tx_hdr.pos_offset = 0u;
             tx_hdr.quant_scheme = (uint8_t)VTLK_QUANT_RAW;
             tx_hdr.codec = (uint8_t)VTLK_CODEC_NONE;
-            tx_hdr.payload_bytes = (uint32_t)vtlk_payload_bytes;
             tx_hdr.raw_bytes = (uint32_t)state_written;
             tx_hdr.sequence = (uint64_t)run + 1u;
 
-            if (vtlk_ring_push(&ring_a, &tx_hdr, vtlk_tx_buf) != VTLK_OK) {
+            if (vtlk_ring_commit_write(&ring_a, &wslot, &tx_hdr, vtlk_payload_bytes) != (int)VTLK_OK) {
+                (void)vtlk_ring_abort_write(&ring_a, &wslot);
                 goto cleanup;
             }
             ts1 = vtlk_bench_now_ns();
 
             tr0 = vtlk_bench_now_ns();
-            if (vtlk_ring_pop(&ring_b, &rx_hdr, vtlk_rx_buf, ring_b.max_payload_bytes) != VTLK_OK) {
+            if (vtlk_ring_acquire_read(&ring_b, &rslot) != (int)VTLK_OK) {
                 goto cleanup;
             }
-            if (rx_hdr.model_family_hash != receiver_hash ||
-                rx_hdr.d_model != d_model ||
-                (rx_hdr.flags & VTLK_FLAG_KV_STATE) == 0u ||
-                rx_hdr.quant_scheme != (uint8_t)VTLK_QUANT_RAW ||
-                rx_hdr.pos_offset != 0u ||
-                rx_hdr.payload_bytes < VTLK_LLAMA_KV_META_SIZE) {
+            if (rslot.header.model_family_hash != receiver_hash ||
+                rslot.header.d_model != d_model ||
+                (rslot.header.flags & VTLK_FLAG_KV_STATE) == 0u ||
+                rslot.header.quant_scheme != (uint8_t)VTLK_QUANT_RAW ||
+                rslot.header.pos_offset != 0u ||
+                rslot.bytes < VTLK_LLAMA_KV_META_SIZE) {
+                (void)vtlk_ring_release_read(&ring_b, &rslot);
                 goto cleanup;
             }
-            vtlk_llama_kv_meta_decode(vtlk_rx_buf, &rx_meta);
+            vtlk_llama_kv_meta_decode((const uint8_t *)rslot.payload, &rx_meta);
             if (rx_meta.magic != VTLK_LLAMA_KV_META_MAGIC ||
                 rx_meta.llama_build != local_build ||
-                (size_t)rx_hdr.payload_bytes != sizeof(vtlk_llama_kv_meta_t) + (size_t)rx_meta.raw_state_bytes) {
+                rslot.bytes != sizeof(vtlk_llama_kv_meta_t) + (size_t)rx_meta.raw_state_bytes) {
+                (void)vtlk_ring_release_read(&ring_b, &rslot);
                 goto cleanup;
             }
             if (!restore_kv_and_decode_last(ctx_b,
-                                            vtlk_rx_buf + VTLK_LLAMA_KV_META_SIZE,
+                                            (const uint8_t *)rslot.payload + VTLK_LLAMA_KV_META_SIZE,
                                             (size_t)rx_meta.raw_state_bytes,
                                             (llama_token)rx_meta.last_token_id,
                                             n_tokens)) {
+                (void)vtlk_ring_release_read(&ring_b, &rslot);
+                goto cleanup;
+            }
+            if (vtlk_ring_release_read(&ring_b, &rslot) != (int)VTLK_OK) {
                 goto cleanup;
             }
             tr1 = vtlk_bench_now_ns();
@@ -529,7 +539,7 @@ int main(int argc, char **argv)
                 t_samples[idx] = (ts1 - ts0) + (tr1 - tr0);
             }
         }
-        results[2].name = "Vect-Link SHM (KV_RAW)";
+        results[2].name = "Vect-Link SHM (Zero-Copy)";
         results[2].payload_bytes = vtlk_payload_bytes;
         results[2].sender = vtlk_bench_compute_stats(s_samples, iters);
         results[2].receiver = vtlk_bench_compute_stats(r_samples, iters);
@@ -589,8 +599,6 @@ cleanup:
     free(t_samples);
     free(r_samples);
     free(s_samples);
-    free(vtlk_rx_buf);
-    free(vtlk_tx_buf);
     free(disk_rx_buf);
     free(disk_tx_buf);
     if (shm_b_open) {

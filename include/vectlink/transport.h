@@ -25,7 +25,26 @@ typedef struct vtlk_ring {
     uint32_t max_payload_bytes;
     uint64_t cached_read_seq;
     uint64_t cached_write_seq;
+    int write_in_flight;
+    uint32_t write_slot_index;
+    uint64_t write_seq_pending;
+    int read_in_flight;
+    uint32_t read_slot_index;
+    uint64_t read_seq_pending;
 } vtlk_ring_t;
+
+typedef struct {
+    void     *payload;       /* Direct pointer to 64B-aligned payload area in SHM */
+    size_t    capacity;      /* Maximum usable payload capacity in bytes */
+    uint32_t  slot_index;    /* Internal slot index validated on commit */
+} vtlk_write_slot_t;
+
+typedef struct {
+    vtlk_header_t header;    /* Validated stack copy (immune to TOCTOU) */
+    const void   *payload;   /* Read-only direct pointer into SHM */
+    size_t        bytes;     /* Exact CRC32C-validated payload size */
+    uint32_t      slot_index;
+} vtlk_read_slot_t;
 
 /**
  * @brief Handle to an OS-backed shared memory region.
@@ -123,6 +142,44 @@ vtlk_status_t vtlk_ring_pop(vtlk_ring_t *ring,
                             vtlk_header_t *hdr_out,
                             void *payload_out,
                             size_t payload_out_cap);
+
+/**
+ * @brief Acquires direct write access to the next available ring slot (zero-copy).
+ *
+ * Producer-only. Returns VTLK_ERR_BUSY if a write slot is already in flight,
+ * or VTLK_ERR_FULL if the ring has no free slots.
+ */
+int vtlk_ring_acquire_write(vtlk_ring_t *ring, vtlk_write_slot_t *out_slot);
+
+/**
+ * @brief Commits an in-flight zero-copy write slot and publishes it to the consumer.
+ *
+ * Computes payload_crc32c directly over @p slot->payload, encodes @p hdr_template
+ * with @p payload_bytes, and advances write_seq with release semantics.
+ */
+int vtlk_ring_commit_write(vtlk_ring_t *ring,
+                           const vtlk_write_slot_t *slot,
+                           const vtlk_header_t *hdr_template,
+                           size_t payload_bytes);
+
+/**
+ * @brief Aborts an in-flight zero-copy write slot without publishing it.
+ */
+int vtlk_ring_abort_write(vtlk_ring_t *ring, const vtlk_write_slot_t *slot);
+
+/**
+ * @brief Acquires direct read-only access to the next published ring slot (zero-copy).
+ *
+ * Consumer-only. Decodes the 64B header into @p out_slot->header and verifies
+ * payload_crc32c before returning. Returns VTLK_ERR_BUSY if a read slot is
+ * already in flight, or VTLK_ERR_EMPTY if no packet is available.
+ */
+int vtlk_ring_acquire_read(vtlk_ring_t *ring, vtlk_read_slot_t *out_slot);
+
+/**
+ * @brief Releases an in-flight zero-copy read slot, making it reusable by the producer.
+ */
+int vtlk_ring_release_read(vtlk_ring_t *ring, const vtlk_read_slot_t *slot);
 
 /**
  * @brief Creates and maps a new OS shared memory region.

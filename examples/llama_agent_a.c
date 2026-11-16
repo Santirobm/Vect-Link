@@ -46,7 +46,6 @@ int main(int argc, char **argv)
     uint32_t n_tokens;
     llama_token *tokens = NULL;
     float *latent_tensor = NULL;
-    uint8_t *payload_buf = NULL;
     size_t total_elems = 0u;
     size_t max_payload_bytes = 0u;
     size_t written_bytes = 0u;
@@ -54,8 +53,10 @@ int main(int argc, char **argv)
     uint32_t ring_cap;
     vtlk_shm_t shm;
     vtlk_ring_t ring;
+    vtlk_write_slot_t wslot;
     vtlk_header_t hdr;
     vtlk_status_t st;
+    int rc_slot;
     uint64_t t0;
     uint64_t t1;
     int rc = 1;
@@ -213,13 +214,6 @@ int main(int argc, char **argv)
         ring_cap = KV_RING_CAP;
     }
 
-    payload_buf = (uint8_t *)malloc(max_payload_bytes);
-    if (payload_buf == NULL) {
-        fprintf(stderr, "llama_agent_a: OOM allocating payload buffer (%zu B)\n",
-                max_payload_bytes);
-        goto cleanup;
-    }
-
     ring_bytes = vtlk_ring_required_bytes(ring_cap, (uint32_t)max_payload_bytes, NULL);
     if (ring_bytes == 0u) {
         fprintf(stderr, "llama_agent_a: vtlk_ring_required_bytes overflow\n");
@@ -249,11 +243,27 @@ int main(int argc, char **argv)
     hdr.sequence = 1u;
 
     t0 = vtlk_llama_now_ns();
+    for (;;) {
+        rc_slot = vtlk_ring_acquire_write(&ring, &wslot);
+        if (rc_slot == (int)VTLK_OK) {
+            break;
+        }
+        if (rc_slot == (int)VTLK_ERR_FULL) {
+            vtlk_llama_cpu_yield();
+            continue;
+        }
+        fprintf(stderr, "llama_agent_a: vtlk_ring_acquire_write failed (%d)\n", rc_slot);
+        vtlk_shm_close(&shm);
+        vtlk_shm_unlink(shm_name);
+        goto cleanup;
+    }
+
     if (mode == VTLK_MODE_EMBD) {
         st = vtlk_encode_tensor(latent_tensor, n_tokens, d_model, VTLK_QUANT_INT4,
-                                payload_buf, max_payload_bytes, &written_bytes);
+                                (uint8_t *)wslot.payload, wslot.capacity, &written_bytes);
         if (st != VTLK_OK) {
             fprintf(stderr, "llama_agent_a: vtlk_encode_tensor failed (%d)\n", (int)st);
+            (void)vtlk_ring_abort_write(&ring, &wslot);
             vtlk_shm_close(&shm);
             vtlk_shm_unlink(shm_name);
             goto cleanup;
@@ -262,16 +272,17 @@ int main(int argc, char **argv)
         hdr.pos_offset = 0u;
         hdr.quant_scheme = (uint8_t)VTLK_QUANT_INT4;
         hdr.codec = (uint8_t)VTLK_CODEC_NONE;
-        hdr.payload_bytes = (uint32_t)written_bytes;
         hdr.raw_bytes = (uint32_t)(total_elems * sizeof(float));
     } else {
-        size_t state_cap = max_payload_bytes - (size_t)VTLK_LLAMA_KV_META_SIZE;
+        size_t state_cap = wslot.capacity - (size_t)VTLK_LLAMA_KV_META_SIZE;
+        uint8_t *slot_bytes = (uint8_t *)wslot.payload;
         size_t state_written = llama_state_seq_get_data(
-            ctx, payload_buf + VTLK_LLAMA_KV_META_SIZE, state_cap, 0);
+            ctx, slot_bytes + VTLK_LLAMA_KV_META_SIZE, state_cap, 0);
         vtlk_llama_kv_meta_t kv_meta;
         if (state_written == 0u || state_written > state_cap) {
             fprintf(stderr, "llama_agent_a: llama_state_seq_get_data failed (%zu)\n",
                     state_written);
+            (void)vtlk_ring_abort_write(&ring, &wslot);
             vtlk_shm_close(&shm);
             vtlk_shm_unlink(shm_name);
             goto cleanup;
@@ -280,27 +291,20 @@ int main(int argc, char **argv)
         kv_meta.llama_build = vtlk_llama_build_stamp();
         kv_meta.last_token_id = (int32_t)tokens[n_tokens - 1u];
         kv_meta.raw_state_bytes = (uint32_t)state_written;
-        vtlk_llama_kv_meta_encode(&kv_meta, payload_buf);
+        vtlk_llama_kv_meta_encode(&kv_meta, slot_bytes);
 
         written_bytes = (size_t)VTLK_LLAMA_KV_META_SIZE + state_written;
         hdr.flags = VTLK_FLAG_KV_STATE;
         hdr.pos_offset = 0u;
         hdr.quant_scheme = (uint8_t)VTLK_QUANT_RAW;
         hdr.codec = (uint8_t)VTLK_CODEC_NONE;
-        hdr.payload_bytes = (uint32_t)written_bytes;
         hdr.raw_bytes = (uint32_t)state_written;
     }
 
-    for (;;) {
-        st = vtlk_ring_push(&ring, &hdr, payload_buf);
-        if (st == VTLK_OK) {
-            break;
-        }
-        if (st == VTLK_ERR_FULL) {
-            vtlk_llama_cpu_yield();
-            continue;
-        }
-        fprintf(stderr, "llama_agent_a: vtlk_ring_push failed (%d)\n", (int)st);
+    rc_slot = vtlk_ring_commit_write(&ring, &wslot, &hdr, written_bytes);
+    if (rc_slot != (int)VTLK_OK) {
+        fprintf(stderr, "llama_agent_a: vtlk_ring_commit_write failed (%d)\n", rc_slot);
+        (void)vtlk_ring_abort_write(&ring, &wslot);
         vtlk_shm_close(&shm);
         vtlk_shm_unlink(shm_name);
         goto cleanup;
@@ -332,7 +336,6 @@ int main(int argc, char **argv)
     rc = 0;
 
 cleanup:
-    free(payload_buf);
     free(latent_tensor);
     free(tokens);
     if (ctx != NULL) {
