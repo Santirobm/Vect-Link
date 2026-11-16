@@ -40,6 +40,7 @@ jobs:
           cmake -B build-py -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build-py --target vectlink_shared
           VTLK_LIB_PATH="${{ github.workspace }}/build-py" python3 -m unittest discover -s python/tests -v
+          rm -rf build build-py
 
       - name: Test Clean Venv Packaging (scikit-build-core)
         if: matrix.cc == 'gcc'
