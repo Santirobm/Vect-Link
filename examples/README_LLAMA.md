@@ -1,9 +1,14 @@
 # Vect-Link `llama.cpp` Latent Bridge (`llama_latent_bridge`)
 
-Proof-of-concept connecting two independent OS processes running [`llama.cpp`](https://github.com/ggml-org/llama.cpp) via **Vect-Link Binary INT4 + Shared Memory** instead of text/JSON serialization.
+Proof-of-concept connecting two independent OS processes running [`llama.cpp`](https://github.com/ggml-org/llama.cpp) over **Vect-Link Shared Memory IPC**, supporting two distinct modes with complementary roles:
 
-- **Producer (`llama_agent_a`)**: Loads a GGUF model, tokenizes a prompt, executes a forward pass with embeddings enabled (`LLAMA_POOLING_TYPE_NONE`), hashes `llama_model_desc` (64-bit FNV-1a) into `header.model_family_hash` along with `d_model = llama_model_n_embd(model)`, quantizes the `[n_tokens x d_model]` hidden-state / embedding tensor to `VTLK_QUANT_INT4`, and pushes it into the Vect-Link shared-memory ring buffer.
-- **Consumer (`llama_agent_b`)**: Loads its GGUF model, attaches to the shared-memory ring buffer, strictly validates `model_family_hash` and `d_model` (rejecting mismatched models), decodes the `VTLK_QUANT_INT4` tensor back to FP32, injects the vectors directly into `llama_batch.embd` (no tokens), runs `llama_decode`, and autoregressively generates `--n-predict` tokens using a greedy sampler.
+- **`--mode kv-state` (Coherent Multi-Process Text Continuation):** Functional demonstration of cross-process inference handoff. Agent A evaluates the prompt (`embeddings = false`), packages the serialized sequence KV-Cache (`llama_state_seq_get_data`) prefixed with a 16-byte little-endian `vtlk_llama_kv_meta_t` header under `VTLK_QUANT_RAW` + `VTLK_FLAG_KV_STATE`, and transfers it via `vtlk_ring_push`. Agent B strictly validates compatibility, verifies `restored == meta.raw_state_bytes` from `llama_state_seq_set_data`, trims the last prompt position (`llama_memory_seq_rm`), re-evaluates `last_token_id` for deterministic logits, and generates semantically coherent continuation tokens without repeating full prefill.
+- **`--mode embd` (INT4 Latent Tensor Transport & Reconstruction Benchmark):** Quantized hidden-state transport benchmark. Agent A extracts per-token `llama_get_embeddings_ith` vectors, quantizes `[n_tokens x d_model]` to `VTLK_QUANT_INT4`, and pushes via SHM; Agent B dequantizes back to FP32 and checks cosine similarity (`--verify-ref`). *(See Architecture Note below on why raw layer-N outputs re-injected into layer-0 `batch.embd` collapse semantically during text continuation.)*
+
+Both modes share compatibility/wire helpers in [examples/llama_bridge_common.h](file:///c:/Users/sgi.lm/Desktop/Vect-Link/examples/llama_bridge_common.h), hashing:
+1. GGUF exact byte size (`_stat64` / `stat`) + first 64 KB of GGUF headers/metadata,
+2. Structural model invariants (`llama_model_desc`, `n_embd`, `n_layer`, `n_head`, `rope_type`, `rope_freq_scale_train`), and
+3. In `--mode kv-state`: runtime build stamp (`LLAMA_STATE_SEQ_VERSION` + `llama_version()` / `LLAMA_BUILD_NUMBER`), `llama_n_ctx(ctx)`, and initial `llama_state_seq_get_size(ctx, 0)`.
 
 ---
 

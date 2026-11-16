@@ -5,71 +5,14 @@
 #endif
 
 #include "vectlink/vectlink.h"
-#include "llama.h"
+#include "llama_bridge_common.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#else
-#include <sched.h>
-#include <time.h>
-#endif
-
-#define DEFAULT_SHM_NAME   "/vtlk_llama_bridge"
 #define DEFAULT_RING_CAP   8u
 #define KV_RING_CAP        2u
-#define VTLK_FLAG_KV_STATE (1u << 0)
-
-typedef enum vtlk_bridge_mode {
-    VTLK_MODE_EMBD = 0,
-    VTLK_MODE_KV_STATE = 1
-} vtlk_bridge_mode_t;
-
-static uint64_t now_ns(void)
-{
-#ifdef _WIN32
-    static LARGE_INTEGER freq = { { 0, 0 } };
-    LARGE_INTEGER counter;
-    uint64_t q;
-    uint64_t f;
-    if (freq.QuadPart == 0) {
-        QueryPerformanceFrequency(&freq);
-    }
-    QueryPerformanceCounter(&counter);
-    q = (uint64_t)counter.QuadPart;
-    f = (uint64_t)freq.QuadPart;
-    return (q / f) * 1000000000ULL + ((q % f) * 1000000000ULL) / f;
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-#endif
-}
-
-static void cpu_yield(void)
-{
-#ifdef _WIN32
-    SwitchToThread();
-#else
-    sched_yield();
-#endif
-}
-
-static uint64_t fnv1a_64(const char *s)
-{
-    uint64_t h = 14695981039346656037ULL;
-    while (*s != '\0') {
-        h ^= (uint64_t)(uint8_t)(*s++);
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
 
 static void print_usage(const char *prog)
 {
@@ -78,19 +21,6 @@ static void print_usage(const char *prog)
             "[--mode embd|kv-state] [--shm /vtlk_llama_bridge] "
             "[--dump-ref <file.bin>]\n",
             prog);
-}
-
-static int parse_mode(const char *s, vtlk_bridge_mode_t *out)
-{
-    if (strcmp(s, "embd") == 0) {
-        *out = VTLK_MODE_EMBD;
-        return 1;
-    }
-    if (strcmp(s, "kv-state") == 0) {
-        *out = VTLK_MODE_KV_STATE;
-        return 1;
-    }
-    return 0;
 }
 
 int main(int argc, char **argv)
@@ -136,7 +66,7 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
             prompt = argv[++i];
         } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
-            if (!parse_mode(argv[++i], &mode)) {
+            if (!vtlk_llama_parse_mode(argv[++i], &mode)) {
                 print_usage(argv[0]);
                 return 1;
             }
@@ -174,7 +104,6 @@ int main(int argc, char **argv)
 
     memset(model_desc, 0, sizeof(model_desc));
     llama_model_desc(model, model_desc, sizeof(model_desc));
-    model_hash = fnv1a_64(model_desc);
 
     n_tokens_i32 = -llama_tokenize(vocab, prompt, (int32_t)strlen(prompt),
                                    NULL, 0, true, true);
@@ -197,7 +126,7 @@ int main(int argc, char **argv)
     }
 
     cparams = llama_context_default_params();
-    cparams.n_ctx = (n_tokens < 512u) ? 512u : (n_tokens + 64u);
+    cparams.n_ctx = (n_tokens <= 512u) ? 512u : (n_tokens + 64u);
     cparams.n_batch = n_tokens;
     if (mode == VTLK_MODE_EMBD) {
         cparams.embeddings = true;
@@ -209,6 +138,14 @@ int main(int argc, char **argv)
     ctx = llama_init_from_model(model, cparams);
     if (ctx == NULL) {
         fprintf(stderr, "llama_agent_a: failed to create llama_context\n");
+        goto cleanup;
+    }
+
+    /* Compute compatibility hash before decode so KV initial layout matches Agent B */
+    model_hash = vtlk_llama_compute_compat_hash(
+        model_path, model, ctx, (mode == VTLK_MODE_KV_STATE) ? 1 : 0);
+    if (model_hash == 0ULL) {
+        fprintf(stderr, "llama_agent_a: failed to compute compatibility hash\n");
         goto cleanup;
     }
 
@@ -264,12 +201,15 @@ int main(int argc, char **argv)
         ring_cap = DEFAULT_RING_CAP;
     } else {
         size_t state_size = llama_state_seq_get_size(ctx, 0);
-        if (state_size == 0u || state_size > (size_t)(UINT32_MAX - 64u)) {
+        size_t raw_packet_bytes;
+        if (state_size == 0u ||
+            state_size > (size_t)(UINT32_MAX - VTLK_LLAMA_KV_META_SIZE - 64u)) {
             fprintf(stderr, "llama_agent_a: invalid KV-cache state size (%zu)\n", state_size);
             goto cleanup;
         }
-        /* Align slot max_payload to 64-byte cache line with safety margin */
-        max_payload_bytes = (state_size + 63u) & ~(size_t)63u;
+        /* Align slot max_payload (16B KV meta + state bytes) to 64B cache line */
+        raw_packet_bytes = (size_t)VTLK_LLAMA_KV_META_SIZE + state_size;
+        max_payload_bytes = (raw_packet_bytes + 63u) & ~(size_t)63u;
         ring_cap = KV_RING_CAP;
     }
 
@@ -308,7 +248,7 @@ int main(int argc, char **argv)
     hdr.n_tokens = n_tokens;
     hdr.sequence = 1u;
 
-    t0 = now_ns();
+    t0 = vtlk_llama_now_ns();
     if (mode == VTLK_MODE_EMBD) {
         st = vtlk_encode_tensor(latent_tensor, n_tokens, d_model, VTLK_QUANT_INT4,
                                 payload_buf, max_payload_bytes, &written_bytes);
@@ -319,25 +259,36 @@ int main(int argc, char **argv)
             goto cleanup;
         }
         hdr.flags = 0u;
+        hdr.pos_offset = 0u;
         hdr.quant_scheme = (uint8_t)VTLK_QUANT_INT4;
         hdr.codec = (uint8_t)VTLK_CODEC_NONE;
         hdr.payload_bytes = (uint32_t)written_bytes;
         hdr.raw_bytes = (uint32_t)(total_elems * sizeof(float));
     } else {
-        written_bytes = llama_state_seq_get_data(ctx, payload_buf, max_payload_bytes, 0);
-        if (written_bytes == 0u || written_bytes > max_payload_bytes) {
+        size_t state_cap = max_payload_bytes - (size_t)VTLK_LLAMA_KV_META_SIZE;
+        size_t state_written = llama_state_seq_get_data(
+            ctx, payload_buf + VTLK_LLAMA_KV_META_SIZE, state_cap, 0);
+        vtlk_llama_kv_meta_t kv_meta;
+        if (state_written == 0u || state_written > state_cap) {
             fprintf(stderr, "llama_agent_a: llama_state_seq_get_data failed (%zu)\n",
-                    written_bytes);
+                    state_written);
             vtlk_shm_close(&shm);
             vtlk_shm_unlink(shm_name);
             goto cleanup;
         }
+        kv_meta.magic = VTLK_LLAMA_KV_META_MAGIC;
+        kv_meta.llama_build = vtlk_llama_build_stamp();
+        kv_meta.last_token_id = (int32_t)tokens[n_tokens - 1u];
+        kv_meta.raw_state_bytes = (uint32_t)state_written;
+        vtlk_llama_kv_meta_encode(&kv_meta, payload_buf);
+
+        written_bytes = (size_t)VTLK_LLAMA_KV_META_SIZE + state_written;
         hdr.flags = VTLK_FLAG_KV_STATE;
-        hdr.pos_offset = (uint32_t)tokens[n_tokens - 1u];
-        hdr.quant_scheme = (uint8_t)VTLK_QUANT_FP16;
+        hdr.pos_offset = 0u;
+        hdr.quant_scheme = (uint8_t)VTLK_QUANT_RAW;
         hdr.codec = (uint8_t)VTLK_CODEC_NONE;
         hdr.payload_bytes = (uint32_t)written_bytes;
-        hdr.raw_bytes = (uint32_t)written_bytes;
+        hdr.raw_bytes = (uint32_t)state_written;
     }
 
     for (;;) {
@@ -346,7 +297,7 @@ int main(int argc, char **argv)
             break;
         }
         if (st == VTLK_ERR_FULL) {
-            cpu_yield();
+            vtlk_llama_cpu_yield();
             continue;
         }
         fprintf(stderr, "llama_agent_a: vtlk_ring_push failed (%d)\n", (int)st);
@@ -354,7 +305,7 @@ int main(int argc, char **argv)
         vtlk_shm_unlink(shm_name);
         goto cleanup;
     }
-    t1 = now_ns();
+    t1 = vtlk_llama_now_ns();
 
     printf("[Agent A] Mode: %s\n", (mode == VTLK_MODE_KV_STATE) ? "kv-state" : "embd");
     printf("[Agent A] Model: %s (hash=0x%016llx, d_model=%u)\n",

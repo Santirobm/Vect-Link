@@ -36,7 +36,8 @@ typedef enum vtlk_quant_scheme {
     VTLK_QUANT_FP16 = 0,
     VTLK_QUANT_INT4_BLOCK = 1,
     VTLK_QUANT_INT4 = 1,
-    VTLK_QUANT_RVQ10 = 2
+    VTLK_QUANT_RVQ10 = 2,
+    VTLK_QUANT_RAW = 3
 } vtlk_quant_scheme_t;
 
 typedef enum vtlk_layout {

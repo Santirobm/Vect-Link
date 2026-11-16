@@ -30,7 +30,7 @@ static int vtlk_validate_params(const vtlk_header_t *hdr)
     if (hdr->d_model == 0u || hdr->n_tokens == 0u) {
         return 0;
     }
-    if (hdr->quant_scheme > (uint8_t)VTLK_QUANT_RVQ10) {
+    if (hdr->quant_scheme > (uint8_t)VTLK_QUANT_RAW) {
         return 0;
     }
     if (hdr->layout != (uint8_t)VTLK_LAYOUT_ROW_MAJOR) {

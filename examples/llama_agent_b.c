@@ -5,61 +5,14 @@
 #endif
 
 #include "vectlink/vectlink.h"
-#include "llama.h"
+#include "llama_bridge_common.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#else
-#include <sched.h>
-#include <time.h>
-#endif
-
-#define DEFAULT_SHM_NAME   "/vtlk_llama_bridge"
 #define DEFAULT_N_PREDICT  32u
 #define MAX_SHM_MAP_BYTES  (512u * 1024u * 1024u)
-#define VTLK_FLAG_KV_STATE (1u << 0)
-
-typedef enum vtlk_bridge_mode {
-    VTLK_MODE_EMBD = 0,
-    VTLK_MODE_KV_STATE = 1
-} vtlk_bridge_mode_t;
-
-static uint64_t now_ns(void)
-{
-#ifdef _WIN32
-    static LARGE_INTEGER freq = { { 0, 0 } };
-    LARGE_INTEGER counter;
-    uint64_t q;
-    uint64_t f;
-    if (freq.QuadPart == 0) {
-        QueryPerformanceFrequency(&freq);
-    }
-    QueryPerformanceCounter(&counter);
-    q = (uint64_t)counter.QuadPart;
-    f = (uint64_t)freq.QuadPart;
-    return (q / f) * 1000000000ULL + ((q % f) * 1000000000ULL) / f;
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-#endif
-}
-
-static void cpu_yield(void)
-{
-#ifdef _WIN32
-    SwitchToThread();
-#else
-    sched_yield();
-#endif
-}
 
 static void sleep_ms(unsigned int ms)
 {
@@ -71,16 +24,6 @@ static void sleep_ms(unsigned int ms)
     ts.tv_nsec = (long)((ms % 1000u) * 1000000u);
     nanosleep(&ts, NULL);
 #endif
-}
-
-static uint64_t fnv1a_64(const char *s)
-{
-    uint64_t h = 14695981039346656037ULL;
-    while (*s != '\0') {
-        h ^= (uint64_t)(uint8_t)(*s++);
-        h *= 1099511628211ULL;
-    }
-    return h;
 }
 
 static void verify_against_ref(const char *ref_arg,
@@ -178,19 +121,6 @@ static void print_usage(const char *prog)
             prog);
 }
 
-static int parse_mode(const char *s, vtlk_bridge_mode_t *out)
-{
-    if (strcmp(s, "embd") == 0) {
-        *out = VTLK_MODE_EMBD;
-        return 1;
-    }
-    if (strcmp(s, "kv-state") == 0) {
-        *out = VTLK_MODE_KV_STATE;
-        return 1;
-    }
-    return 0;
-}
-
 int main(int argc, char **argv)
 {
     const char *model_path = NULL;
@@ -233,7 +163,7 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             model_path = argv[++i];
         } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
-            if (!parse_mode(argv[++i], &mode)) {
+            if (!vtlk_llama_parse_mode(argv[++i], &mode)) {
                 print_usage(argv[0]);
                 return 1;
             }
@@ -273,10 +203,10 @@ int main(int argc, char **argv)
 
     memset(model_desc, 0, sizeof(model_desc));
     llama_model_desc(model, model_desc, sizeof(model_desc));
-    expected_hash = fnv1a_64(model_desc);
 
-    printf("[Agent B] Loaded model: %s (hash=0x%016llx, d_model=%u)\n",
-           model_desc, (unsigned long long)expected_hash, expected_d_model);
+    printf("[Agent B] Loaded model: %s (d_model=%u, mode=%s)\n",
+           model_desc, expected_d_model,
+           (mode == VTLK_MODE_KV_STATE) ? "kv-state" : "embd");
     printf("[Agent B] Waiting for SHM '%s'...\n", shm_name);
     fflush(stdout);
 
@@ -328,14 +258,14 @@ int main(int argc, char **argv)
     }
 
     for (;;) {
-        t_pop0 = now_ns();
+        t_pop0 = vtlk_llama_now_ns();
         st = vtlk_ring_pop(&ring, &hdr, rx_payload, ring.max_payload_bytes);
         if (st == VTLK_OK) {
-            t_pop1 = now_ns();
+            t_pop1 = vtlk_llama_now_ns();
             break;
         }
         if (st == VTLK_ERR_EMPTY) {
-            cpu_yield();
+            vtlk_llama_cpu_yield();
             continue;
         }
         fprintf(stderr, "llama_agent_b: vtlk_ring_pop failed (%d)\n", (int)st);
@@ -343,15 +273,6 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     vtlk_shm_close(&shm);
-
-    if (hdr.model_family_hash != expected_hash || hdr.d_model != expected_d_model) {
-        fprintf(stderr,
-                "[Agent B] REJECTED incompatible packet: "
-                "got hash=0x%016llx d_model=%u, expected hash=0x%016llx d_model=%u\n",
-                (unsigned long long)hdr.model_family_hash, hdr.d_model,
-                (unsigned long long)expected_hash, expected_d_model);
-        goto cleanup;
-    }
 
     {
         int pkt_is_kv = ((hdr.flags & VTLK_FLAG_KV_STATE) != 0u);
@@ -367,13 +288,29 @@ int main(int argc, char **argv)
     }
 
     cparams = llama_context_default_params();
-    cparams.n_ctx = (hdr.n_tokens + n_predict < 512u) ? 512u : (hdr.n_tokens + n_predict + 64u);
+    cparams.n_ctx = (hdr.n_tokens + n_predict <= 512u) ? 512u : (hdr.n_tokens + n_predict + 64u);
     cparams.n_batch = (hdr.n_tokens > 0u) ? hdr.n_tokens : 1u;
     cparams.embeddings = false;
 
     ctx = llama_init_from_model(model, cparams);
     if (ctx == NULL) {
         fprintf(stderr, "llama_agent_b: failed to create llama_context\n");
+        goto cleanup;
+    }
+
+    /* Validate weight identity + structural params (+ KV env in kv-state mode) */
+    expected_hash = vtlk_llama_compute_compat_hash(
+        model_path, model, ctx, (mode == VTLK_MODE_KV_STATE) ? 1 : 0);
+    if (expected_hash == 0ULL) {
+        fprintf(stderr, "llama_agent_b: failed to compute compatibility hash\n");
+        goto cleanup;
+    }
+    if (hdr.model_family_hash != expected_hash || hdr.d_model != expected_d_model) {
+        fprintf(stderr,
+                "[Agent B] REJECTED incompatible packet: "
+                "got hash=0x%016llx d_model=%u, expected hash=0x%016llx d_model=%u\n",
+                (unsigned long long)hdr.model_family_hash, hdr.d_model,
+                (unsigned long long)expected_hash, expected_d_model);
         goto cleanup;
     }
 
@@ -385,18 +322,18 @@ int main(int argc, char **argv)
             goto cleanup;
         }
 
-        t0 = now_ns();
+        t0 = vtlk_llama_now_ns();
         st = vtlk_decode_tensor(rx_payload, hdr.payload_bytes,
                                 hdr.n_tokens, hdr.d_model,
                                 (vtlk_quant_scheme_t)hdr.quant_scheme,
                                 decoded, total_elems);
-        t1 = now_ns();
+        t1 = vtlk_llama_now_ns();
         if (st != VTLK_OK) {
             fprintf(stderr, "llama_agent_b: vtlk_decode_tensor failed (%d)\n", (int)st);
             goto cleanup;
         }
 
-        printf("[Agent B] Mode: embd\n");
+        printf("[Agent B] Mode: embd (hash=0x%016llx)\n", (unsigned long long)expected_hash);
         printf("[Agent B] Received & decoded %u x %u tensor (%u B INT4) in %.2f us\n",
                hdr.n_tokens, hdr.d_model, hdr.payload_bytes,
                (double)((t_pop1 - t_pop0) + (t1 - t0)) / 1000.0);
@@ -426,23 +363,74 @@ int main(int argc, char **argv)
             llama_batch_free(embd_batch);
         }
     } else {
+        vtlk_llama_kv_meta_t kv_meta;
+        uint32_t local_build = vtlk_llama_build_stamp();
+        const uint8_t *raw_state_ptr;
         size_t restored;
-        llama_token last_tok = (llama_token)hdr.pos_offset;
-        llama_pos last_pos = (llama_pos)(hdr.n_tokens - 1u);
+        llama_token last_tok;
+        llama_pos last_pos;
         struct llama_batch bridge_batch;
 
-        t_set0 = now_ns();
-        restored = llama_state_seq_set_data(ctx, rx_payload, hdr.payload_bytes, 0);
-        t_set1 = now_ns();
-        if (restored == 0u) {
-            fprintf(stderr, "llama_agent_b: llama_state_seq_set_data failed\n");
+        if (hdr.quant_scheme != (uint8_t)VTLK_QUANT_RAW) {
+            fprintf(stderr,
+                    "[Agent B] REJECTED kv-state quant_scheme=%u (expected VTLK_QUANT_RAW=%u)\n",
+                    (unsigned)hdr.quant_scheme, (unsigned)VTLK_QUANT_RAW);
+            goto cleanup;
+        }
+        if (hdr.pos_offset != 0u) {
+            fprintf(stderr,
+                    "[Agent B] REJECTED kv-state nonzero pos_offset=%u\n",
+                    hdr.pos_offset);
+            goto cleanup;
+        }
+        if (hdr.payload_bytes < VTLK_LLAMA_KV_META_SIZE) {
+            fprintf(stderr,
+                    "[Agent B] REJECTED truncated kv-state payload (%u B)\n",
+                    hdr.payload_bytes);
             goto cleanup;
         }
 
-        printf("[Agent B] Mode: kv-state\n");
-        printf("[Agent B] Received & restored KV-Cache (%u B, prompt=%u tokens) in %.2f us\n",
-               hdr.payload_bytes, hdr.n_tokens,
+        vtlk_llama_kv_meta_decode(rx_payload, &kv_meta);
+        if (kv_meta.magic != VTLK_LLAMA_KV_META_MAGIC) {
+            fprintf(stderr,
+                    "[Agent B] REJECTED invalid kv_meta magic=0x%08x\n",
+                    kv_meta.magic);
+            goto cleanup;
+        }
+        if (kv_meta.llama_build != local_build) {
+            fprintf(stderr,
+                    "[Agent B] REJECTED llama build mismatch: got 0x%08x, expected 0x%08x\n",
+                    kv_meta.llama_build, local_build);
+            goto cleanup;
+        }
+        if (kv_meta.raw_state_bytes == 0u ||
+            (size_t)hdr.payload_bytes != sizeof(vtlk_llama_kv_meta_t) + (size_t)kv_meta.raw_state_bytes) {
+            fprintf(stderr,
+                    "[Agent B] REJECTED kv-state size mismatch: payload=%u B, expected %zu B\n",
+                    hdr.payload_bytes,
+                    sizeof(vtlk_llama_kv_meta_t) + (size_t)kv_meta.raw_state_bytes);
+            goto cleanup;
+        }
+
+        raw_state_ptr = rx_payload + VTLK_LLAMA_KV_META_SIZE;
+        t_set0 = vtlk_llama_now_ns();
+        restored = llama_state_seq_set_data(ctx, raw_state_ptr, (size_t)kv_meta.raw_state_bytes, 0);
+        t_set1 = vtlk_llama_now_ns();
+        if (restored == 0u || restored != (size_t)kv_meta.raw_state_bytes) {
+            fprintf(stderr,
+                    "llama_agent_b: llama_state_seq_set_data restored %zu B != expected %u B\n",
+                    restored, kv_meta.raw_state_bytes);
+            goto cleanup;
+        }
+
+        printf("[Agent B] Mode: kv-state (hash=0x%016llx, build=0x%08x)\n",
+               (unsigned long long)expected_hash, local_build);
+        printf("[Agent B] Received & restored KV-Cache (%u B state + %zu B meta, prompt=%u tokens) in %.2f us\n",
+               kv_meta.raw_state_bytes, sizeof(vtlk_llama_kv_meta_t), hdr.n_tokens,
                (double)((t_pop1 - t_pop0) + (t_set1 - t_set0)) / 1000.0);
+
+        last_tok = (llama_token)kv_meta.last_token_id;
+        last_pos = (llama_pos)(hdr.n_tokens - 1u);
 
         /* Trim last prompt token position and re-evaluate it to obtain fresh deterministic logits */
         if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, last_pos, -1)) {

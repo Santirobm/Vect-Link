@@ -257,6 +257,18 @@ static void test_rejections_and_edge_cases(void)
     bad[4] = 128u;
     bad[5] = 0u;
     assert(vtlk_header_decode(bad, sizeof(bad), &out) == VTLK_ERR_INVALID_HEADER_SIZE);
+
+    /* Explicit VTLK_QUANT_RAW scheme roundtrip */
+    vtlk_header_init_defaults(&in);
+    in.d_model = 896u;
+    in.n_tokens = 11u;
+    in.quant_scheme = (uint8_t)VTLK_QUANT_RAW;
+    in.payload_bytes = 135924u;
+    in.raw_bytes = 135908u;
+    assert(vtlk_header_encode(&in, wire, sizeof(wire)) == VTLK_OK);
+    assert(wire[28] == (uint8_t)VTLK_QUANT_RAW);
+    assert(vtlk_header_decode(wire, sizeof(wire), &out) == VTLK_OK);
+    assert(out.quant_scheme == (uint8_t)VTLK_QUANT_RAW);
 }
 
 int main(void)
