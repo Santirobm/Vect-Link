@@ -163,7 +163,7 @@ if(VTLK_BUILD_LLAMA_BRIDGE)
         list(APPEND VTLK_LLAMA_INCLUDES "${GGML_INCLUDE_DIR}")
     endif()
 
-    foreach(llama_target llama_agent_a llama_agent_b benchmark_llama_handoff)
+    foreach(llama_target llama_agent_a llama_agent_b benchmark_llama_handoff benchmark_llama_multiprocess)
         add_executable(${llama_target} examples/${llama_target}.c)
         # llama.h and ggml.h use C11 features (_Noreturn, typedef redefs, anonymous unions)
         set_target_properties(${llama_target} PROPERTIES

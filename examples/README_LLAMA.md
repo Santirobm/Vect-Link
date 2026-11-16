@@ -201,3 +201,27 @@ Measured locally on Windows (`Clang 22.1.8 -O3`, `qwen2.5-0.5b-instruct-q4_k_m.g
 | **Vect-Link SHM (`KV_RAW`)** | 6,298,224 | 3,484.10 | **26,122.30** | **29,660.70** | **48.88x** | **EXACT (`3175`)** |
 
 *(Note: Exports `llama_handoff_benchmark.csv` in the working directory. `Vect-Link SHM (KV_RAW)` uses runtime CPUID-dispatched hardware **SSE4.2 CRC32C** over the 6.3 MB payload on both push and pop plus compatibility hash validation, matching buffered RAM page-cache `stdio` latency while providing full end-to-end integrity and exact Top-1 greedy token parity with 512-token re-prefill.)*
+
+---
+
+## 9. Two-Process OS Scaling Benchmark (`benchmark_llama_multiprocess`)
+
+Spawns **two independent OS processes** (`--role producer` and `--role consumer`) coordinated via a separate SPSC `VTLK` control ring (`_c2p`) and measures true wall-clock cross-process handoff across `128`, `512`, `1024`, and `2048` tokens (`n_ctx = 2304`, `n_batch = 512`, `threads = 4`, `warmup = 3`, `iters = 15`) using the v0.9.0 **True Zero-Copy Slot Loan API** + hardware **SSE4.2 CRC32C**:
+
+```powershell
+$env:PATH = "C:\msys64\clang64\bin;C:\Users\sgi.lm\Desktop\llama.cpp\build\bin;" + $env:PATH
+.\build-llama\benchmark_llama_multiprocess.exe `
+  --model C:\Users\sgi.lm\Desktop\models\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  --lengths "128,512,1024,2048" --iters 15 --warmup 3 --threads 4
+```
+
+Measured locally on Windows (`Clang 22.1.8 -O3`, `qwen2.5-0.5b-instruct-q4_k_m.gguf`):
+
+| Tokens | KV Bytes | Re-Prefill p50 / p95 / p99 (ms) | Vect-Link p50 / p95 / p99 (ms) | Speedup p50 | Speedup p99 | Top-1 Match |
+| ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| **128** | 1,575,024 | 364.21 / 450.36 / 450.36 | **22.62 / 24.00 / 24.00** | 16.10x | 18.76x | EXACT (`10058`) |
+| **512** | 6,298,224 | 1,622.62 / 1,716.13 / 1,716.13 | **25.02 / 25.57 / 25.57** | 64.84x | 67.11x | EXACT (`3175`) |
+| **1024** | 12,595,824 | 3,381.13 / 3,692.37 / 3,692.37 | **30.19 / 30.59 / 30.59** | 111.99x | 120.72x | EXACT (`476`) |
+| **2048** | 25,191,024 | 7,366.57 / 8,006.97 / 8,006.97 | **39.93 / 40.56 / 40.56** | **184.49x** | **197.42x** | **EXACT (`1424`)** |
+
+*(Exports `llama_multiprocess_benchmark.csv` in the working directory.)*

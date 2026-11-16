@@ -5,6 +5,7 @@ cmake-build-*/
 out/
 benchmark_results.csv
 llama_handoff_benchmark.csv
+llama_multiprocess_benchmark.csv
 ref_embd.bin
 
 # Binaries & artifacts
