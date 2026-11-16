@@ -92,6 +92,13 @@ if(VTLK_DISABLE_AVX2)
     target_compile_definitions(vectlink_shared PRIVATE VTLK_DISABLE_AVX2=1)
 endif()
 
+if(DEFINED SKBUILD)
+    install(TARGETS vectlink_shared
+        RUNTIME DESTINATION vectlink
+        LIBRARY DESTINATION vectlink
+    )
+endif()
+
 function(vectlink_add_test target_name source_file)
     add_executable(${target_name} ${source_file})
     target_link_libraries(${target_name} PRIVATE vectlink)

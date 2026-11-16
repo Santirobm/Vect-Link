@@ -240,6 +240,25 @@ static void test_zero_copy_slot_loan(void)
         assert(vtlk_ring_release_read(&cons, &rslot) == (int)VTLK_OK);
     }
 
+    /* vtlk_ring_close must return VTLK_ERR_BUSY while write or read loan is active */
+    assert(vtlk_ring_acquire_write(&prod, &wslot) == (int)VTLK_OK);
+    assert(vtlk_ring_close(&prod) == (int)VTLK_ERR_BUSY);
+    memset(wslot.payload, 0xCC, 32u);
+    make_header(&h_tmpl, 999u, 32u);
+    assert(vtlk_ring_commit_write(&prod, &wslot, &h_tmpl, 32u) == (int)VTLK_OK);
+
+    assert(vtlk_ring_acquire_read(&cons, &rslot) == (int)VTLK_OK);
+    assert(vtlk_ring_close(&cons) == (int)VTLK_ERR_BUSY);
+    assert(vtlk_ring_abort_read(&cons, &rslot) == (int)VTLK_OK);
+
+    /* Packet remains readable after abort_read */
+    assert(vtlk_ring_acquire_read(&cons, &rslot) == (int)VTLK_OK);
+    assert(rslot.header.sequence == 999u);
+    assert(vtlk_ring_release_read(&cons, &rslot) == (int)VTLK_OK);
+
+    assert(vtlk_ring_close(&prod) == (int)VTLK_OK);
+    assert(vtlk_ring_close(&cons) == (int)VTLK_OK);
+
     test_free_aligned64(arena);
 }
 

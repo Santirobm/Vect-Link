@@ -5,9 +5,10 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import os
+import platform
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 VTLK_HEADER_SIZE = 64
 VTLK_PROTOCOL_VERSION = 0x0001
@@ -164,17 +165,26 @@ def _candidate_lib_names() -> tuple[str, ...]:
 
 
 def find_vectlink_library() -> str:
+    names = _candidate_lib_names()
+    searched: List[str] = []
+
     env_path = os.environ.get("VTLK_LIB_PATH")
     if env_path:
         p = Path(env_path).expanduser()
         if p.is_dir():
-            for name in _candidate_lib_names():
+            for name in names:
                 cand = p / name
+                searched.append(str(cand))
                 if cand.is_file():
                     return str(cand)
-        if p.is_file():
-            return str(p)
-        raise FileNotFoundError(f"VTLK_LIB_PATH points to missing library: {env_path}")
+        else:
+            searched.append(str(p))
+            if p.is_file():
+                return str(p)
+        raise FileNotFoundError(
+            f"VTLK_LIB_PATH={env_path!r} did not resolve to a valid library on "
+            f"{sys.platform} ({platform.machine()}). Checked: {searched}"
+        )
 
     pkg_dir = Path(__file__).resolve().parent
     repo_root = pkg_dir.parent.parent
@@ -189,8 +199,9 @@ def find_vectlink_library() -> str:
         repo_root / "out" / "build",
     ]
     for d in search_dirs:
-        for name in _candidate_lib_names():
+        for name in names:
             cand = d / name
+            searched.append(str(cand))
             if cand.is_file():
                 return str(cand)
 
@@ -198,9 +209,14 @@ def find_vectlink_library() -> str:
     if sys_found:
         return sys_found
 
+    searched_str = "\n  - ".join(searched)
     raise FileNotFoundError(
-        "Could not locate vectlink shared library (vectlink.dll / libvectlink.so / libvectlink.dylib). "
-        "Build the CMake 'vectlink_shared' target or set VTLK_LIB_PATH."
+        f"Could not locate Vect-Link shared library ({', '.join(names)}) for "
+        f"platform={sys.platform!r}, arch={platform.machine()!r}.\n"
+        f"Searched paths:\n  - {searched_str}\n"
+        f"Build it with: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && "
+        f"cmake --build build --target vectlink_shared\n"
+        f"Or set VTLK_LIB_PATH=/path/to/{names[0]}"
     )
 
 
@@ -329,6 +345,15 @@ def _bind_library(path: str) -> ctypes.CDLL:
         ctypes.POINTER(VtlkReadSlot),
     ]
     lib.vtlk_ring_release_read.restype = ctypes.c_int
+
+    lib.vtlk_ring_abort_read.argtypes = [
+        ctypes.POINTER(VtlkRing),
+        ctypes.POINTER(VtlkReadSlot),
+    ]
+    lib.vtlk_ring_abort_read.restype = ctypes.c_int
+
+    lib.vtlk_ring_close.argtypes = [ctypes.POINTER(VtlkRing)]
+    lib.vtlk_ring_close.restype = ctypes.c_int
 
     # OS Shared Memory
     lib.vtlk_shm_create.argtypes = [

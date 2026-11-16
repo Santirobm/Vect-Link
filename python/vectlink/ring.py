@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import ctypes
 import struct
+import weakref
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from ._ffi import (
     VTLK_RING_CTRL_SIZE,
+    BufferTooSmallError,
     ShmError,
     VtlkHeader,
     VtlkRing,
@@ -87,10 +89,14 @@ class WriteSlot:
         cap = int(slot.capacity)
         if cap > 0:
             raw_arr = (ctypes.c_uint8 * cap).from_address(int(slot.payload))
+            self._raw_ref: Optional[weakref.ref[Any]] = weakref.ref(raw_arr)
             self._mv: Optional[memoryview] = memoryview(raw_arr).cast("B")
+            del raw_arr
         else:
+            self._raw_ref = None
             self._mv = memoryview(bytearray())
         self._released = False
+        self._borrowed_views: List[weakref.ref[Any]] = []
         self._pending_bytes: Optional[int] = None
         self._pending_n_tokens: int = 1
         self._pending_d_model: int = 1
@@ -113,7 +119,9 @@ class WriteSlot:
         src = memoryview(data)
         n = src.nbytes
         if n > len(buf):
-            raise ValueError(f"Payload ({n} B) exceeds slot capacity ({len(buf)} B)")
+            raise BufferTooSmallError(
+                -2, f"Payload ({n} B) exceeds slot capacity ({len(buf)} B)"
+            )
         buf[:n] = src.cast("B")
         self._pending_bytes = n
         self._pending_n_tokens = 1
@@ -208,10 +216,14 @@ class WriteSlot:
         check_status(rc, "vtlk_ring_abort_write")
 
     def _release_mv(self) -> None:
-        self._released = True
         if self._mv is not None:
             self._mv.release()
             self._mv = None
+        if self._raw_ref is not None and self._raw_ref() is not None:
+            raise BufferError(
+                "Cannot release WriteSlot while a slice or NumPy/ctypes view of slot.buffer is still alive"
+            )
+        self._released = True
 
     def __enter__(self) -> "WriteSlot":
         return self
@@ -236,8 +248,11 @@ class ReadSlot:
         nbytes = int(slot.bytes)
         if nbytes > 0:
             raw_arr = (ctypes.c_uint8 * nbytes).from_address(int(slot.payload))
+            self._raw_ref: Optional[weakref.ref[Any]] = weakref.ref(raw_arr)
             self._mv: Optional[memoryview] = memoryview(raw_arr).cast("B").toreadonly()
+            del raw_arr
         else:
+            self._raw_ref = None
             self._mv = memoryview(b"")
         self._released = False
 
@@ -285,18 +300,51 @@ class ReadSlot:
         check_status(rc, "vtlk_decode_tensor")
         return out_mv if allocated else out_float_buffer
 
-    def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
+    def to_numpy(self, dtype: Any = None, shape: Any = None, *, copy: bool = True) -> Any:
+        """Return slot payload as a NumPy ndarray.
+
+        By default (copy=True), returns an independent copy safe to use after
+        exiting the ReadSlot context. With copy=False, returns a zero-copy
+        view tied to the ReadSlot lifetime (must be deleted before release()).
+        """
+        import numpy as np
+
+        if dtype is None:
+            dtype = np.float32
+        arr = np.frombuffer(self.buffer, dtype=dtype)
+        if shape is not None:
+            arr = arr.reshape(shape)
+        return arr.copy() if copy else arr
+
+    def _release_mv(self) -> None:
         if self._mv is not None:
             self._mv.release()
             self._mv = None
+        if self._raw_ref is not None and self._raw_ref() is not None:
+            raise BufferError(
+                "Cannot release ReadSlot while a slice or NumPy/ctypes view of slot.buffer is still alive"
+            )
+        self._released = True
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._release_mv()
         rc = self._lib.vtlk_ring_release_read(
             ctypes.byref(self._ring._ring),
             ctypes.byref(self._slot),
         )
         check_status(rc, "vtlk_ring_release_read")
+
+    def abort(self) -> None:
+        if self._released:
+            return
+        self._release_mv()
+        rc = self._lib.vtlk_ring_abort_read(
+            ctypes.byref(self._ring._ring),
+            ctypes.byref(self._slot),
+        )
+        check_status(rc, "vtlk_ring_abort_read")
 
     def __enter__(self) -> "ReadSlot":
         return self
@@ -413,8 +461,17 @@ class VectLinkRing:
     def close(self) -> None:
         if self._closed:
             return
+        rc = self._lib.vtlk_ring_close(ctypes.byref(self._ring))
+        check_status(rc, "vtlk_ring_close")
         self._closed = True
         self._lib.vtlk_shm_close(ctypes.byref(self._shm))
+
+    def __del__(self) -> None:
+        try:
+            if not getattr(self, "_closed", True):
+                self.close()
+        except Exception:
+            pass
 
     def __enter__(self) -> "VectLinkRing":
         return self

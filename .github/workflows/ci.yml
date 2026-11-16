@@ -34,6 +34,47 @@ jobs:
       - name: Run CTest
         run: ctest --test-dir build --output-on-failure
 
+      - name: Build Release Shared Library & Run Python Tests
+        if: matrix.cc == 'gcc'
+        run: |
+          cmake -B build-py -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-py --target vectlink_shared
+          VTLK_LIB_PATH="${{ github.workspace }}/build-py" python3 -m unittest discover -s python/tests -v
+
+      - name: Test Clean Venv Packaging (scikit-build-core)
+        if: matrix.cc == 'gcc'
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install ./python
+          python -m unittest discover -s python/tests -v
+
+  macos:
+    name: macOS (Clang)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Configure & Build
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Run CTest
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Test Clean Venv Packaging & Python Tests
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install ./python
+          python -m unittest discover -s python/tests -v
+
   windows-msvc:
     name: Windows (MSVC /W4 /WX)
     runs-on: windows-latest
@@ -50,3 +91,12 @@ jobs:
 
       - name: Run CTest
         run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Test Clean Venv Packaging & Python Tests
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\Activate.ps1
+          python -m pip install --upgrade pip
+          pip install ./python
+          python -m unittest discover -s python/tests -v

@@ -475,3 +475,36 @@ int vtlk_ring_release_read(vtlk_ring_t *ring, const vtlk_read_slot_t *slot)
     ring->read_in_flight = 0;
     return (int)VTLK_OK;
 }
+
+int vtlk_ring_abort_read(vtlk_ring_t *ring, const vtlk_read_slot_t *slot)
+{
+    if (ring == NULL || slot == NULL) {
+        return (int)VTLK_ERR_NULL_PTR;
+    }
+    if (ring->base == NULL || ring->read_in_flight == 0 ||
+        slot->slot_index != ring->read_slot_index) {
+        return (int)VTLK_ERR_INVALID_PARAM;
+    }
+
+    ring->read_in_flight = 0;
+    return (int)VTLK_OK;
+}
+
+int vtlk_ring_close(vtlk_ring_t *ring)
+{
+    if (ring == NULL) {
+        return (int)VTLK_ERR_NULL_PTR;
+    }
+    if (ring->write_in_flight != 0 || ring->read_in_flight != 0) {
+        return (int)VTLK_ERR_BUSY;
+    }
+
+    ring->base = NULL;
+    ring->total_bytes = 0u;
+    ring->capacity = 0u;
+    ring->slot_size = 0u;
+    ring->max_payload_bytes = 0u;
+    ring->cached_read_seq = 0u;
+    ring->cached_write_seq = 0u;
+    return (int)VTLK_OK;
+}

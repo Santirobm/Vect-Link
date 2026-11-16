@@ -182,6 +182,18 @@ VTLK_API int vtlk_ring_acquire_read(vtlk_ring_t *ring, vtlk_read_slot_t *out_slo
 VTLK_API int vtlk_ring_release_read(vtlk_ring_t *ring, const vtlk_read_slot_t *slot);
 
 /**
+ * @brief Aborts an in-flight zero-copy read slot without advancing read_seq.
+ */
+VTLK_API int vtlk_ring_abort_read(vtlk_ring_t *ring, const vtlk_read_slot_t *slot);
+
+/**
+ * @brief Closes a ring handle, refusing if any zero-copy slot loan is active.
+ *
+ * Returns VTLK_ERR_BUSY if write_in_flight or read_in_flight is non-zero.
+ */
+VTLK_API int vtlk_ring_close(vtlk_ring_t *ring);
+
+/**
  * @brief Creates and maps a new OS shared memory region.
  *
  * @param shm  Shared memory handle to populate.
