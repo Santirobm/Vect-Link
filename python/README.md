@@ -2,28 +2,19 @@
 
 Zero-dependency **zero-copy** Python bindings over `libvectlink` (`v0.9.0`) using `ctypes` + native `memoryview` (and optional NumPy `ndarray` zero-copy interoperability).
 
-## 1. Build the Shared C Library (`vectlink_shared`)
+## 1. Install the Python Package (`scikit-build-core`)
 
-From the repository root:
-
-```sh
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target vectlink_shared
-```
-
-This produces `build/vectlink.dll` (Windows), `build/libvectlink.so` (Linux), or `build/libvectlink.dylib` (macOS).
-
-## 2. Install the Python Package
+From the repository root, `pip install ./python` compiles `vectlink_shared` (`vectlink.dll` / `libvectlink.so` / `libvectlink.dylib`) and bundles it directly inside `vectlink/`:
 
 ```sh
-pip install -e ./python
+pip install ./python
 # Or with optional NumPy extra:
-pip install -e "./python[numpy]"
+pip install "./python[numpy]"
 ```
 
-If your shared library is in a custom directory, set `VTLK_LIB_PATH=/path/to/vectlink.dll` (or `.so`/`.dylib`).
+*(Alternatively, for editable/in-repo use, build `vectlink_shared` manually with `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --target vectlink_shared` or set `VTLK_LIB_PATH=/path/to/vectlink.dll`.)*
 
-## 3. Zero-Copy Slot Loan Usage
+## 2. Zero-Copy Slot Loan Usage
 
 ```python
 import numpy as np
@@ -41,9 +32,12 @@ with VectLinkRing.create("/my_ring", slot_capacity=128 * 1024, slot_count=4) as 
         # Consumer reads & decodes directly from SHM slot into NumPy buffer
         with cons.acquire_read() as rslot:
             rslot.decode_tensor(out)
+            # Or use rslot.to_numpy(dtype=np.float32, copy=True) for a safe decoupled array
 ```
 
-## 4. Run Tests & Two-Process Example
+*(Dangling zero-copy slices or `to_numpy(copy=False)` arrays kept alive past `commit()`/`release()` raise `BufferError`, and closing a ring with active slot loans raises `RingBusyError`.)*
+
+## 3. Run Tests & Two-Process Example
 
 ```sh
 python -m unittest discover -s python/tests -v
