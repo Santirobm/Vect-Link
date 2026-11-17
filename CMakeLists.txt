@@ -15,6 +15,11 @@ set(VECTLINK_SOURCES
     src/codec/fp16.c
     src/codec/int4.c
     src/codec/codec.c
+    src/kv/kv_hash.c
+    src/kv/kv_arena.c
+    src/kv/kv_cow.c
+    src/kv/kv_tier.c
+    src/sync/desc_ring.c
 )
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|amd64|x86_64|X86_64|i686|x86")
@@ -32,9 +37,15 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|amd64|x86_64|X86_64|i686|x86")
 endif()
 
 if(WIN32)
-    list(APPEND VECTLINK_SOURCES src/transport/shm_windows.c)
+    list(APPEND VECTLINK_SOURCES
+        src/transport/shm_windows.c
+        src/sync/os_notify_windows.c
+    )
 else()
-    list(APPEND VECTLINK_SOURCES src/transport/shm_posix.c)
+    list(APPEND VECTLINK_SOURCES
+        src/transport/shm_posix.c
+        src/sync/os_notify_posix.c
+    )
 endif()
 
 add_library(vectlink STATIC ${VECTLINK_SOURCES})
@@ -47,7 +58,9 @@ target_include_directories(vectlink
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-if(UNIX AND NOT APPLE)
+if(WIN32)
+    target_link_libraries(vectlink PUBLIC advapi32)
+elseif(UNIX AND NOT APPLE)
     find_package(Threads REQUIRED)
     target_link_libraries(vectlink PUBLIC rt m Threads::Threads)
 elseif(UNIX)
@@ -77,7 +90,9 @@ target_include_directories(vectlink_shared
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-if(UNIX AND NOT APPLE)
+if(WIN32)
+    target_link_libraries(vectlink_shared PUBLIC advapi32)
+elseif(UNIX AND NOT APPLE)
     target_link_libraries(vectlink_shared PUBLIC rt m Threads::Threads)
 elseif(UNIX)
     target_link_libraries(vectlink_shared PUBLIC Threads::Threads)
@@ -117,6 +132,8 @@ vectlink_add_test(test_ring_buffer tests/test_ring_buffer.c)
 vectlink_add_test(test_cross_process tests/test_cross_process.c)
 vectlink_add_test(test_codec tests/test_codec.c)
 target_include_directories(test_codec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+vectlink_add_test(test_kv_cow tests/test_kv_cow.c)
+target_include_directories(test_kv_cow PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_executable(agent_sender examples/agent_sender.c)
 target_link_libraries(agent_sender PRIVATE vectlink)
@@ -154,6 +171,15 @@ if(MSVC)
     target_compile_options(benchmark_transport PRIVATE /O2 /W4 /WX)
 else()
     target_compile_options(benchmark_transport PRIVATE -O3 -Wall -Wextra -Werror -pedantic)
+endif()
+
+add_executable(bench_cow_git benchmarks/bench_cow_git.c)
+target_include_directories(bench_cow_git PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(bench_cow_git PRIVATE vectlink)
+if(MSVC)
+    target_compile_options(bench_cow_git PRIVATE /O2 /W4 /WX)
+else()
+    target_compile_options(bench_cow_git PRIVATE -O3 -Wall -Wextra -Werror -pedantic)
 endif()
 
 if(VTLK_BUILD_LLAMA_BRIDGE)
@@ -197,7 +223,7 @@ if(VTLK_BUILD_LLAMA_BRIDGE)
         list(APPEND VTLK_LLAMA_INCLUDES "${GGML_INCLUDE_DIR}")
     endif()
 
-    foreach(llama_target llama_agent_a llama_agent_b benchmark_llama_handoff benchmark_llama_multiprocess)
+    foreach(llama_target llama_agent_a llama_agent_b llama_kv_paged_bridge benchmark_llama_handoff benchmark_llama_multiprocess)
         add_executable(${llama_target} examples/${llama_target}.c)
         # llama.h and ggml.h use C11 features (_Noreturn, typedef redefs, anonymous unions)
         set_target_properties(${llama_target} PROPERTIES

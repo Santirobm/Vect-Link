@@ -38,6 +38,58 @@ static vtlk_status_t vtlk_win_format_shm_name(const char *name,
     return VTLK_OK;
 }
 
+static int vtlk_win_init_user_sa(SECURITY_ATTRIBUTES *sa,
+                                 SECURITY_DESCRIPTOR *sd,
+                                 uint8_t *acl_buf,
+                                 size_t acl_buf_cap)
+{
+    HANDLE h_token = NULL;
+    uint8_t token_buf[256];
+    DWORD ret_len = 0u;
+    TOKEN_USER *p_user;
+    PACL p_acl;
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &h_token)) {
+        return 0;
+    }
+
+    if (!GetTokenInformation(h_token,
+                             TokenUser,
+                             token_buf,
+                             (DWORD)sizeof(token_buf),
+                             &ret_len)) {
+        CloseHandle(h_token);
+        return 0;
+    }
+    CloseHandle(h_token);
+
+    p_user = (TOKEN_USER *)(void *)token_buf;
+    if (!InitializeSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION)) {
+        return 0;
+    }
+
+    p_acl = (PACL)(void *)acl_buf;
+    if (!InitializeAcl(p_acl, (DWORD)acl_buf_cap, ACL_REVISION)) {
+        return 0;
+    }
+
+    if (!AddAccessAllowedAce(p_acl,
+                             ACL_REVISION,
+                             FILE_ALL_ACCESS,
+                             p_user->User.Sid)) {
+        return 0;
+    }
+
+    if (!SetSecurityDescriptorDacl(sd, TRUE, p_acl, FALSE)) {
+        return 0;
+    }
+
+    sa->nLength = (DWORD)sizeof(*sa);
+    sa->lpSecurityDescriptor = sd;
+    sa->bInheritHandle = FALSE;
+    return 1;
+}
+
 vtlk_status_t vtlk_shm_create(vtlk_shm_t *shm, const char *name, size_t size)
 {
     HANDLE h_map;
@@ -45,6 +97,9 @@ vtlk_status_t vtlk_shm_create(vtlk_shm_t *shm, const char *name, size_t size)
     DWORD size_hi;
     DWORD size_lo;
     vtlk_status_t st;
+    SECURITY_ATTRIBUTES sa;
+    SECURITY_DESCRIPTOR sd;
+    uint8_t acl_buf[256];
 
     if (shm == NULL || name == NULL) {
         return VTLK_ERR_NULL_PTR;
@@ -59,11 +114,15 @@ vtlk_status_t vtlk_shm_create(vtlk_shm_t *shm, const char *name, size_t size)
         return st;
     }
 
+    if (!vtlk_win_init_user_sa(&sa, &sd, acl_buf, sizeof(acl_buf))) {
+        return VTLK_ERR_SHM;
+    }
+
     size_hi = (DWORD)(((uint64_t)size >> 32) & 0xFFFFFFFFu);
     size_lo = (DWORD)((uint64_t)size & 0xFFFFFFFFu);
 
     h_map = CreateFileMappingA(INVALID_HANDLE_VALUE,
-                               NULL,
+                               &sa,
                                PAGE_READWRITE,
                                size_hi,
                                size_lo,

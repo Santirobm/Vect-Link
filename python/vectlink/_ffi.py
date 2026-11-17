@@ -16,6 +16,33 @@ VTLK_LAYER_FINAL = 0xFFFF
 VTLK_RING_CTRL_SIZE = 192
 VTLK_SHM_VERSION = 1
 
+VTLK_KV_MAGIC = 0x56544B56
+VTLK_KV_FORMAT_VERSION = 2
+VTLK_KV_MAX_BRANCH_BLOCKS = 1024
+VTLK_KV_MAX_SNAPSHOTS = 256
+VTLK_KV_INVALID_BLOCK_ID = 0xFFFFFFFF
+VTLK_KV_HASH_EMPTY = 0xFFFFFFFF
+VTLK_KV_HASH_TOMBSTONE = 0xFFFFFFFE
+VTLK_KV_CACHE_LINE = 64
+
+VTLK_KV_DTYPE_FP16 = 0
+VTLK_KV_DTYPE_BF16 = 1
+VTLK_KV_DTYPE_Q8_0 = 2
+VTLK_KV_DTYPE_Q4_0 = 3
+VTLK_KV_DTYPE_FP32 = 4
+VTLK_KV_DTYPE_RAW_LLAMA = 5
+
+VTLK_KV_FLAG_NONE = 0
+VTLK_KV_FLAG_IMMUTABLE = 1 << 0
+VTLK_KV_FLAG_EVICTABLE = 1 << 1
+VTLK_KV_FLAG_DIRTY = 1 << 2
+VTLK_KV_FLAG_TIER_L2 = 1 << 3
+VTLK_KV_FLAG_TIER_L3 = 1 << 4
+
+VTLK_KV_SNAP_FREE = 0
+VTLK_KV_SNAP_WRITING = 1
+VTLK_KV_SNAP_READY = 2
+
 VTLK_OK = 0
 VTLK_ERR_NULL_PTR = -1
 VTLK_ERR_BUFFER_TOO_SMALL = -2
@@ -156,6 +183,100 @@ class VtlkReadSlot(ctypes.Structure):
     ]
 
 
+class VtlkKvIdentity(ctypes.Structure):
+    _fields_ = [
+        ("token_prefix_hash", ctypes.c_uint64),
+        ("model_arch_hash", ctypes.c_uint64),
+        ("rope_config_hash", ctypes.c_uint64),
+        ("lora_adapter_hash", ctypes.c_uint64),
+        ("pos_offset", ctypes.c_uint32),
+        ("token_count", ctypes.c_uint32),
+        ("kv_dtype", ctypes.c_uint32),
+        ("layer_count", ctypes.c_uint32),
+        ("head_dim", ctypes.c_uint32),
+        ("kv_head_count", ctypes.c_uint32),
+    ]
+
+
+class VtlkKvBlockHeader(ctypes.Structure):
+    _fields_ = [
+        ("magic", ctypes.c_uint32),
+        ("storage_format_version", ctypes.c_uint32),
+        ("kv_dtype", ctypes.c_uint32),
+        ("token_count", ctypes.c_uint32),
+        ("block_size_bytes", ctypes.c_uint64),
+        ("token_prefix_hash", ctypes.c_uint64),
+        ("model_arch_hash", ctypes.c_uint64),
+        ("rope_config_hash", ctypes.c_uint64),
+        ("lora_adapter_hash", ctypes.c_uint64),
+        ("pos_offset", ctypes.c_uint32),
+        ("payload_crc32c", ctypes.c_uint32),
+        ("layer_count", ctypes.c_uint32),
+        ("head_dim", ctypes.c_uint32),
+        ("kv_head_count", ctypes.c_uint32),
+        ("reserved_imm", ctypes.c_uint32),
+        ("refcount", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("lru_stamp", ctypes.c_uint64),
+        ("tier_state", ctypes.c_uint32),
+        ("reserved_mut", ctypes.c_uint32),
+        ("l2_offset", ctypes.c_uint64),
+        ("l3_id", ctypes.c_uint64),
+        ("reserved_end", ctypes.c_uint64),
+    ]
+
+
+class VtlkKvBranch(ctypes.Structure):
+    _fields_ = [
+        ("parent_snapshot_id", ctypes.c_uint64),
+        ("block_count", ctypes.c_uint32),
+        ("total_tokens", ctypes.c_uint32),
+        ("model_arch_hash", ctypes.c_uint64),
+        ("rope_config_hash", ctypes.c_uint64),
+        ("lora_adapter_hash", ctypes.c_uint64),
+        ("kv_dtype", ctypes.c_uint32),
+        ("layer_count", ctypes.c_uint32),
+        ("head_dim", ctypes.c_uint32),
+        ("kv_head_count", ctypes.c_uint32),
+        ("block_ids", ctypes.c_uint32 * VTLK_KV_MAX_BRANCH_BLOCKS),
+    ]
+
+
+class VtlkKvArena(ctypes.Structure):
+    _fields_ = [
+        ("shm", VtlkShm),
+        ("base", ctypes.POINTER(ctypes.c_uint8)),
+        ("total_bytes", ctypes.c_size_t),
+        ("num_blocks", ctypes.c_uint32),
+        ("block_size_bytes", ctypes.c_uint64),
+        ("hash_cap", ctypes.c_uint32),
+        ("max_snapshots", ctypes.c_uint32),
+        ("owns_shm", ctypes.c_int),
+        ("freelist_next_offset", ctypes.c_uint64),
+        ("hash_table_offset", ctypes.c_uint64),
+        ("snapshots_offset", ctypes.c_uint64),
+        ("block_headers_offset", ctypes.c_uint64),
+        ("block_data_offset", ctypes.c_uint64),
+        ("tier", ctypes.c_void_p),
+    ]
+
+
+class VtlkKvArenaStats(ctypes.Structure):
+    _fields_ = [
+        ("num_blocks", ctypes.c_uint32),
+        ("active_blocks", ctypes.c_uint32),
+        ("cached_blocks", ctypes.c_uint32),
+        ("free_blocks", ctypes.c_uint32),
+        ("hash_cap", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+        ("block_size_bytes", ctypes.c_uint64),
+        ("total_bytes", ctypes.c_uint64),
+        ("cache_hits", ctypes.c_uint64),
+        ("cache_misses", ctypes.c_uint64),
+        ("evictions", ctypes.c_uint64),
+    ]
+
+
 def _candidate_lib_names() -> tuple[str, ...]:
     if sys.platform == "win32":
         return ("vectlink.dll", "libvectlink.dll")
@@ -168,7 +289,7 @@ def find_vectlink_library() -> str:
     names = _candidate_lib_names()
     searched: List[str] = []
 
-    env_path = os.environ.get("VTLK_LIB_PATH")
+    env_path = os.environ.get("VTLK_LIB_PATH") or os.environ.get("VECTLINK_LIB_PATH")
     if env_path:
         p = Path(env_path).expanduser()
         if p.is_dir():
@@ -375,6 +496,127 @@ def _bind_library(path: str) -> ctypes.CDLL:
 
     lib.vtlk_shm_unlink.argtypes = [ctypes.c_char_p]
     lib.vtlk_shm_unlink.restype = ctypes.c_int
+
+    # KV Arena & CoW Snapshot / Fork / Restore API
+    lib.vtlk_kv_hash_tokens.argtypes = [
+        ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_size_t,
+    ]
+    lib.vtlk_kv_hash_tokens.restype = ctypes.c_uint64
+
+    lib.vtlk_kv_hash_bytes.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.vtlk_kv_hash_bytes.restype = ctypes.c_uint64
+
+    lib.vtlk_kv_arena_required_bytes.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_uint64,
+    ]
+    lib.vtlk_kv_arena_required_bytes.restype = ctypes.c_size_t
+
+    lib.vtlk_kv_arena_create.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.c_char_p,
+        ctypes.c_uint32,
+        ctypes.c_uint64,
+    ]
+    lib.vtlk_kv_arena_create.restype = ctypes.c_int
+
+    lib.vtlk_kv_arena_open.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.c_char_p,
+    ]
+    lib.vtlk_kv_arena_open.restype = ctypes.c_int
+
+    lib.vtlk_kv_arena_close.argtypes = [ctypes.POINTER(VtlkKvArena)]
+    lib.vtlk_kv_arena_close.restype = None
+
+    lib.vtlk_kv_arena_stats.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.POINTER(VtlkKvArenaStats),
+    ]
+    lib.vtlk_kv_arena_stats.restype = ctypes.c_int
+
+    lib.vtlk_kv_block_alloc.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    lib.vtlk_kv_block_alloc.restype = ctypes.c_int
+
+    lib.vtlk_kv_block_seal.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.c_uint32,
+        ctypes.POINTER(VtlkKvIdentity),
+    ]
+    lib.vtlk_kv_block_seal.restype = ctypes.c_int
+
+    lib.vtlk_kv_block_lookup.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.POINTER(VtlkKvIdentity),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    lib.vtlk_kv_block_lookup.restype = ctypes.c_int
+
+    lib.vtlk_kv_block_retain.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.c_uint32,
+    ]
+    lib.vtlk_kv_block_retain.restype = ctypes.c_int
+
+    lib.vtlk_kv_block_release.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.c_uint32,
+    ]
+    lib.vtlk_kv_block_release.restype = ctypes.c_int
+
+    lib.vtlk_kv_block_data.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.c_uint32,
+    ]
+    lib.vtlk_kv_block_data.restype = ctypes.c_void_p
+
+    lib.vtlk_kv_block_header.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.c_uint32,
+    ]
+    lib.vtlk_kv_block_header.restype = ctypes.POINTER(VtlkKvBlockHeader)
+
+    lib.vtlk_kv_snapshot_create.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.POINTER(VtlkKvBranch),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.vtlk_kv_snapshot_create.restype = ctypes.c_int
+
+    lib.vtlk_kv_fork.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.c_uint64,
+        ctypes.POINTER(VtlkKvBranch),
+    ]
+    lib.vtlk_kv_fork.restype = ctypes.c_int
+
+    lib.vtlk_kv_restore.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.c_uint64,
+        ctypes.POINTER(VtlkKvIdentity),
+        ctypes.POINTER(VtlkKvBranch),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_uint32,
+    ]
+    lib.vtlk_kv_restore.restype = ctypes.c_int
+
+    lib.vtlk_kv_branch_append_block.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.POINTER(VtlkKvBranch),
+        ctypes.c_uint32,
+    ]
+    lib.vtlk_kv_branch_append_block.restype = ctypes.c_int
+
+    lib.vtlk_kv_branch_release.argtypes = [
+        ctypes.POINTER(VtlkKvArena),
+        ctypes.POINTER(VtlkKvBranch),
+    ]
+    lib.vtlk_kv_branch_release.restype = ctypes.c_int
 
     return lib
 

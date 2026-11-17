@@ -10,12 +10,27 @@ from ._ffi import (
     ShmError,
     VectLinkError,
 )
+from .kv import (
+    Branch,
+    KVArena,
+    KVArenaStats,
+    KVBlockView,
+    KVDtype,
+    KVIdentity,
+    Snapshot,
+)
 from .ring import PacketHeader, QuantScheme, ReadSlot, VectLinkRing, WriteSlot
 
 __all__ = [
+    "Branch",
     "BufferTooSmallError",
     "CrcMismatchError",
     "InvalidParamError",
+    "KVArena",
+    "KVArenaStats",
+    "KVBlockView",
+    "KVDtype",
+    "KVIdentity",
     "PacketHeader",
     "QuantScheme",
     "ReadSlot",
@@ -23,6 +38,7 @@ __all__ = [
     "RingEmptyError",
     "RingFullError",
     "ShmError",
+    "Snapshot",
     "VectLinkError",
     "VectLinkRing",
     "WriteSlot",

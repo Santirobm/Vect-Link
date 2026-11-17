@@ -26,9 +26,11 @@ extern "C" {
 #  endif
 #endif
 
-#define VTLK_HEADER_SIZE      64u
-#define VTLK_PROTOCOL_VERSION 0x0001u
-#define VTLK_LAYER_FINAL      0xFFFFu
+#define VTLK_HEADER_SIZE         64u
+#define VTLK_HEADER_V2_SIZE      96u
+#define VTLK_PROTOCOL_VERSION    0x0001u
+#define VTLK_PROTOCOL_VERSION_V2 0x0002u
+#define VTLK_LAYER_FINAL         0xFFFFu
 
 #define VTLK_MAGIC_0 ((uint8_t)'V')
 #define VTLK_MAGIC_1 ((uint8_t)'T')
@@ -48,7 +50,10 @@ typedef enum vtlk_status {
     VTLK_ERR_FULL = -8,
     VTLK_ERR_EMPTY = -9,
     VTLK_ERR_SHM = -10,
-    VTLK_ERR_BUSY = -11
+    VTLK_ERR_BUSY = -11,
+    VTLK_ERR_TIMEOUT = -12,
+    VTLK_ERR_IO = -13,
+    VTLK_ERR_NOT_FOUND = -14
 } vtlk_status_t;
 
 typedef enum vtlk_quant_scheme {
@@ -135,6 +140,78 @@ VTLK_API vtlk_status_t vtlk_header_encode(const vtlk_header_t *hdr,
 VTLK_API vtlk_status_t vtlk_header_decode(const uint8_t *buf,
                                           size_t buf_len,
                                           vtlk_header_t *hdr);
+
+/**
+ * @brief Logical representation of the 96-byte Vect-Link v2 packet header.
+ *
+ * Extends v1 with 64-bit payload_bytes and raw_bytes fields for payloads
+ * exceeding 4 GiB. Never cast directly to or from the wire format.
+ */
+typedef struct vtlk_header_v2 {
+    uint8_t magic[4];
+    uint16_t header_bytes;
+    uint16_t version;
+    uint32_t flags;
+    uint64_t model_family_hash;
+    uint32_t d_model;
+    uint32_t n_tokens;
+    uint8_t quant_scheme;
+    uint8_t layout;
+    uint8_t codec;
+    uint8_t reserved0;
+    uint64_t payload_bytes;
+    uint64_t raw_bytes;
+    uint64_t sequence;
+    uint32_t payload_crc32c;
+    uint16_t layer_index;
+    uint16_t reserved1;
+    uint32_t pos_offset;
+    uint32_t reserved2;
+    uint8_t reserved_ext[20];
+    uint32_t header_crc32c;
+} vtlk_header_v2_t;
+
+/**
+ * @brief Initializes a vtlk_header_v2_t with safe v2 protocol defaults.
+ *
+ * Sets magic to "VTLK", header_bytes to 96, version to 0x0002,
+ * quant_scheme to VTLK_QUANT_FP16, layout to VTLK_LAYOUT_ROW_MAJOR,
+ * codec to VTLK_CODEC_NONE, layer_index to VTLK_LAYER_FINAL, and all
+ * remaining fields to 0.
+ *
+ * @param hdr Pointer to the v2 header struct to initialize (no-op if NULL).
+ */
+VTLK_API void vtlk_header_v2_init_defaults(vtlk_header_v2_t *hdr);
+
+/**
+ * @brief Serializes a vtlk_header_v2_t into a 96-byte little-endian wire buffer.
+ *
+ * Computes and writes header_crc32c over bytes [0..91] at offset 92.
+ *
+ * @param hdr     Source v2 header struct (must have d_model > 0 and n_tokens > 0).
+ * @param buf     Caller-provided destination buffer.
+ * @param buf_len Size of destination buffer in bytes (must be >= 96).
+ * @return VTLK_OK on success, or a negative vtlk_status_t error code.
+ */
+VTLK_API vtlk_status_t vtlk_header_v2_encode(const vtlk_header_v2_t *hdr,
+                                             uint8_t *buf,
+                                             size_t buf_len);
+
+/**
+ * @brief Deserializes and validates a 96-byte little-endian v2 wire header.
+ *
+ * Validates magic ("VTLK"), header_bytes == 96, header_crc32c over [0..91],
+ * protocol version == 0x0002, and basic parameter invariants before
+ * populating *hdr.
+ *
+ * @param buf     Caller-provided source buffer.
+ * @param buf_len Size of source buffer in bytes (must be >= 96).
+ * @param hdr     Destination v2 header struct (untouched on error).
+ * @return VTLK_OK on success, or a negative vtlk_status_t error code.
+ */
+VTLK_API vtlk_status_t vtlk_header_v2_decode(const uint8_t *buf,
+                                             size_t buf_len,
+                                             vtlk_header_v2_t *hdr);
 
 #ifdef __cplusplus
 }
