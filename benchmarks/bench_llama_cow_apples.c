@@ -83,7 +83,8 @@ typedef enum apples_mode {
     MODE_COLD = 0,
     MODE_FILE = 1,
     MODE_SEQ_CP = 2,
-    MODE_COW = 3
+    MODE_COW_ZERO_COPY = 3,
+    MODE_COW_REASSEMBLED = 4
 } apples_mode_t;
 
 typedef struct apples_worker_slot {
@@ -204,13 +205,6 @@ static uint64_t compute_rope_hash(const struct llama_model *model)
     return vtlk_kv_hash_bytes(&cfg, sizeof(cfg));
 }
 
-typedef struct page_header {
-    uint32_t total_state_bytes;
-    uint32_t page_index;
-    uint32_t page_payload_bytes;
-    uint32_t pos_n;
-} page_header_t;
-
 static int partition_state_into_branch(vtlk_kv_arena_t *arena,
                                        vtlk_kv_branch_t *branch,
                                        const uint8_t *state_buf,
@@ -218,7 +212,7 @@ static int partition_state_into_branch(vtlk_kv_arena_t *arena,
                                        uint32_t pos_n,
                                        const vtlk_kv_identity_t *base_id)
 {
-    const size_t max_payload = (size_t)arena->block_size_bytes - sizeof(page_header_t);
+    const size_t max_payload = (size_t)arena->block_size_bytes;
     size_t offset = 0;
     uint32_t page_idx = 0;
     uint64_t rolling_hash = base_id->token_prefix_hash;
@@ -239,19 +233,16 @@ static int partition_state_into_branch(vtlk_kv_arena_t *arena,
         }
 
         uint8_t *dst = (uint8_t *)vtlk_kv_block_data(arena, block_id);
-        if (dst == NULL) {
+        vtlk_kv_block_header_t *hdr = vtlk_kv_block_header(arena, block_id);
+        if (dst == NULL || hdr == NULL) {
             vtlk_kv_block_release(arena, block_id);
             return -1;
         }
 
-        page_header_t phdr;
-        phdr.total_state_bytes = (uint32_t)state_bytes;
-        phdr.page_index = page_idx;
-        phdr.page_payload_bytes = (uint32_t)chunk;
-        phdr.pos_n = pos_n;
-
-        memcpy(dst, &phdr, sizeof(phdr));
-        memcpy(dst + sizeof(phdr), state_buf + offset, chunk);
+        memcpy(dst, state_buf + offset, chunk);
+        if (chunk < max_payload) {
+            memset(dst + chunk, 0, max_payload - chunk);
+        }
 
         uint32_t page_tag = page_idx + 1u;
         rolling_hash = vtlk_kv_hash_tokens(rolling_hash, &page_tag, 1u);
@@ -261,8 +252,14 @@ static int partition_state_into_branch(vtlk_kv_arena_t *arena,
         blk_id.pos_offset = (page_idx == 0) ? 0u : pos_n;
         blk_id.token_count = (page_idx == 0) ? pos_n : 0u;
 
-        if (vtlk_kv_block_seal(arena, block_id, &blk_id) != VTLK_OK ||
-            vtlk_kv_branch_append_block(arena, branch, block_id) != VTLK_OK) {
+        if (vtlk_kv_block_seal(arena, block_id, &blk_id) != VTLK_OK) {
+            vtlk_kv_block_release(arena, block_id);
+            return -1;
+        }
+        /* Store exact page payload bytes out-of-band so contiguous pages stay pure */
+        hdr->reserved_imm = (uint32_t)chunk;
+
+        if (vtlk_kv_branch_append_block(arena, branch, block_id) != VTLK_OK) {
             vtlk_kv_block_release(arena, block_id);
             return -1;
         }
@@ -274,42 +271,74 @@ static int partition_state_into_branch(vtlk_kv_arena_t *arena,
     return 0;
 }
 
-static int reassemble_state_from_ptrs(const void *const *ptrs,
-                                      uint32_t block_count,
+static int prepare_zero_copy_restore_view(vtlk_kv_arena_t *arena,
+                                          const vtlk_kv_branch_t *branch,
+                                          const void *const *ptrs,
+                                          const uint8_t **out_ptr,
+                                          size_t *out_bytes,
+                                          uint32_t *out_pos_n)
+{
+    if (branch == NULL || branch->block_count == 0u || ptrs == NULL) {
+        return -1;
+    }
+
+    size_t aligned_blk = (size_t)((arena->block_size_bytes + VTLK_KV_CACHE_LINE - 1u) &
+                                  ~(uint64_t)(VTLK_KV_CACHE_LINE - 1u));
+    size_t total = 0u;
+    for (uint32_t i = 0u; i < branch->block_count; ++i) {
+        vtlk_kv_block_header_t *hdr = vtlk_kv_block_header(arena, branch->block_ids[i]);
+        if (hdr == NULL || ptrs[i] == NULL) {
+            return -1;
+        }
+        if (i > 0u &&
+            (const uint8_t *)ptrs[i] != (const uint8_t *)ptrs[i - 1u] + aligned_blk) {
+            return -1; /* Non-contiguous */
+        }
+        total += (size_t)hdr->reserved_imm;
+    }
+
+    *out_ptr = (const uint8_t *)ptrs[0];
+    *out_bytes = total;
+    *out_pos_n = branch->total_tokens;
+    return 0;
+}
+
+static int reassemble_state_from_ptrs(vtlk_kv_arena_t *arena,
+                                      const vtlk_kv_branch_t *branch,
+                                      const void *const *ptrs,
                                       uint8_t **out_buf,
                                       size_t *out_bytes,
                                       uint32_t *out_pos_n)
 {
-    if (block_count == 0) {
+    if (branch == NULL || branch->block_count == 0u || ptrs == NULL) {
         return -1;
     }
-    const page_header_t *hdr0 = (const page_header_t *)ptrs[0];
-    size_t total = (size_t)hdr0->total_state_bytes;
+
+    size_t total = 0u;
+    for (uint32_t i = 0u; i < branch->block_count; ++i) {
+        vtlk_kv_block_header_t *hdr = vtlk_kv_block_header(arena, branch->block_ids[i]);
+        if (hdr == NULL) {
+            return -1;
+        }
+        total += (size_t)hdr->reserved_imm;
+    }
+
     uint8_t *buf = (uint8_t *)malloc(total);
     if (buf == NULL) {
         return -1;
     }
 
-    size_t cursor = 0;
-    for (uint32_t i = 0; i < block_count; ++i) {
-        const page_header_t *ph = (const page_header_t *)ptrs[i];
-        const uint8_t *payload = (const uint8_t *)ptrs[i] + sizeof(page_header_t);
-        if (cursor + ph->page_payload_bytes > total) {
-            free(buf);
-            return -1;
-        }
-        memcpy(buf + cursor, payload, ph->page_payload_bytes);
-        cursor += ph->page_payload_bytes;
-    }
-
-    if (cursor != total) {
-        free(buf);
-        return -1;
+    size_t cursor = 0u;
+    for (uint32_t i = 0u; i < branch->block_count; ++i) {
+        vtlk_kv_block_header_t *hdr = vtlk_kv_block_header(arena, branch->block_ids[i]);
+        size_t chunk = (size_t)hdr->reserved_imm;
+        memcpy(buf + cursor, ptrs[i], chunk);
+        cursor += chunk;
     }
 
     *out_buf = buf;
     *out_bytes = total;
-    *out_pos_n = hdr0->pos_n;
+    *out_pos_n = branch->total_tokens;
     return 0;
 }
 
@@ -420,7 +449,7 @@ static int run_worker_process(const char *model_path,
 
     vtlk_kv_arena_t arena;
     int arena_open = 0;
-    if (mode == MODE_COW) {
+    if (mode == MODE_COW_ZERO_COPY || mode == MODE_COW_REASSEMBLED) {
         if (vtlk_kv_arena_open(&arena, ctrl->arena_shm_name) != VTLK_OK) {
             fprintf(stderr, "[worker %u] vtlk_kv_arena_open failed\n", worker_id);
             llama_free(ctx);
@@ -468,7 +497,7 @@ static int run_worker_process(const char *model_path,
             ok = 0;
         }
         cur_pos = (llama_pos)(n_sys + n_suf);
-    } else if (mode == MODE_COW) {
+    } else if (mode == MODE_COW_ZERO_COPY || mode == MODE_COW_REASSEMBLED) {
         const void *ptrs[VTLK_KV_MAX_BRANCH_BLOCKS];
         if (vtlk_kv_fork(&arena, ctrl->snap_id, &forked) != VTLK_OK) {
             ok = 0;
@@ -483,11 +512,21 @@ static int run_worker_process(const char *model_path,
                 ok = 0;
             }
         }
-        if (ok) {
+        if (ok && mode == MODE_COW_ZERO_COPY) {
+            const uint8_t *zc_ptr = NULL;
+            size_t w_bytes = 0;
+            uint32_t w_pos = 0;
+            if (prepare_zero_copy_restore_view(&arena, &forked, ptrs,
+                                               &zc_ptr, &w_bytes, &w_pos) != 0 ||
+                llama_state_seq_set_data(ctx, zc_ptr, w_bytes, 0) == 0) {
+                ok = 0;
+            }
+            cur_pos = (llama_pos)w_pos;
+        } else if (ok && mode == MODE_COW_REASSEMBLED) {
             uint8_t *w_state = NULL;
             size_t w_bytes = 0;
             uint32_t w_pos = 0;
-            if (reassemble_state_from_ptrs(ptrs, forked.block_count,
+            if (reassemble_state_from_ptrs(&arena, &forked, ptrs,
                                            &w_state, &w_bytes, &w_pos) != 0 ||
                 llama_state_seq_set_data(ctx, w_state, w_bytes, 0) == 0) {
                 ok = 0;
@@ -933,13 +972,14 @@ int main(int argc, char **argv)
         static const struct {
             apples_mode_t mode;
             const char *label;
-        } mp_modes[3] = {
-            { MODE_COLD, "Cold Prefill (N procs, from scratch)" },
-            { MODE_FILE, "llama_state_seq_load_file (N procs)" },
-            { MODE_COW,  "Vect-Link CoW (N procs, SHM Arena)" }
+        } mp_modes[4] = {
+            { MODE_COLD,            "Cold Prefill (N procs, from scratch)" },
+            { MODE_FILE,            "llama_state_seq_load_file (N procs)" },
+            { MODE_COW_ZERO_COPY,   "Vect-Link CoW (Direct Zero-Copy)" },
+            { MODE_COW_REASSEMBLED, "Vect-Link CoW (Reassembled Fallback)" }
         };
 
-        for (size_t mi = 0; mi < 3u; ++mi) {
+        for (size_t mi = 0; mi < 4u; ++mi) {
             memset(ctrl, 0, sizeof(*ctrl));
             ctrl->magic = APPLES_CTRL_MAGIC;
             ctrl->num_workers = n;

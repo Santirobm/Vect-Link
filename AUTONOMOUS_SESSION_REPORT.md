@@ -116,19 +116,23 @@ Vect-Link evolucionó de un transporte IPC SPSC lineal a un motor de almacenamie
 
 | N | Method | Pure Fork/Load (µs) | TTFT Mean (ms) | TTFT Max (ms) | Total System RSS (MiB) |
 |---:|:---|---:|---:|---:|---:|
-| 1 | Cold Prefill (N procs) | 0.00 | 1,362.44 | 1,362.44 | 474.70 |
-| 1 | `llama_state_seq_load_file` (N procs) | 3,399.90 | 209.72 | 209.72 | 457.46 |
-| 1 | **Vect-Link CoW (N procs, SHM Arena)** | **5.40** | **169.97** | **169.97** | **460.40** |
-| 1 | `llama_memory_seq_cp` (1 proc, no isol) | 0.00 | 137.93 | 137.93 | 492.01 |
-| 2 | Cold Prefill (N procs) | 0.00 | 1,557.08 | 1,562.83 | 949.26 |
-| 2 | `llama_state_seq_load_file` (N procs) | 3,997.20 | 205.01 | 206.25 | 914.79 |
-| 2 | **Vect-Link CoW (N procs, SHM Arena)** | **6.70** | **241.95** | **252.58** | **920.84** |
-| 2 | `llama_memory_seq_cp` (1 proc, no isol) | 22.30 | 225.17 | 310.37 | 495.61 |
-| 4 | Cold Prefill (N procs) | 0.00 | 3,342.85 | 3,497.25 | 1,898.45 |
-| 4 | `llama_state_seq_load_file` (N procs) | 5,389.97 | 369.48 | 405.50 | 1,830.14 |
-| 4 | **Vect-Link CoW (N procs, SHM Arena)** | **10.78** | **363.90** | **385.03** | **1,841.50** |
-| 4 | `llama_memory_seq_cp` (1 proc, no isol) | 14.30 | 341.38 | 541.65 | 503.01 |
-| 8 | Cold Prefill (N procs) | 0.00 | 4,626.76 | 4,826.23 | 3,796.82 |
-| 8 | `llama_state_seq_load_file` (N procs) | 9,132.17 | 478.79 | 539.66 | 3,660.21 |
-| 8 | **Vect-Link CoW (N procs, SHM Arena)** | **22.94** | **497.59** | **559.61** | **3,683.19** |
-| 8 | `llama_memory_seq_cp` (1 proc, no isol) | 11.80 | 549.96 | 998.80 | 520.21 |
+| 1 | Cold Prefill (N procs) | 0.00 | 1,425.51 | 1,425.51 | 474.67 |
+| 1 | `llama_state_seq_load_file` (N procs) | 3,080.10 | 167.70 | 167.70 | 457.49 |
+| 1 | **Vect-Link CoW (Direct Zero-Copy)** | **5.80** | **170.12** | **170.12** | **460.48** |
+| 1 | Vect-Link CoW (Reassembled Fallback) | 4.50 | 165.51 | 165.51 | 460.46 |
+| 1 | `llama_memory_seq_cp` (1 proc, no isol) | 0.00 | 134.01 | 134.01 | 492.38 |
+| 2 | Cold Prefill (N procs) | 0.00 | 1,453.20 | 1,471.89 | 949.27 |
+| 2 | `llama_state_seq_load_file` (N procs) | 3,596.10 | 178.59 | 178.66 | 915.07 |
+| 2 | **Vect-Link CoW (Direct Zero-Copy)** | **4.90** | **174.67** | **175.80** | **920.83** |
+| 2 | Vect-Link CoW (Reassembled Fallback) | 6.30 | 173.76 | 175.26 | 920.97 |
+| 2 | `llama_memory_seq_cp` (1 proc, no isol) | 19.10 | 169.99 | 227.17 | 495.95 |
+| 4 | Cold Prefill (N procs) | 0.00 | 2,817.96 | 3,102.44 | 1,898.62 |
+| 4 | `llama_state_seq_load_file` (N procs) | 5,077.12 | 319.30 | 388.20 | 1,830.05 |
+| 4 | **Vect-Link CoW (Direct Zero-Copy)** | **7.75** | **303.88** | **367.45** | **1,841.71** |
+| 4 | Vect-Link CoW (Reassembled Fallback) | 6.12 | 315.60 | 397.39 | 1,841.70 |
+| 4 | `llama_memory_seq_cp` (1 proc, no isol) | 12.13 | 289.70 | 465.60 | 503.17 |
+| 8 | Cold Prefill (N procs) | 0.00 | 3,734.32 | 4,311.97 | 3,797.55 |
+| 8 | `llama_state_seq_load_file` (N procs) | 8,923.38 | 467.89 | 556.60 | 3,660.35 |
+| 8 | **Vect-Link CoW (Direct Zero-Copy)** | **23.85** | **476.97** | **560.24** | **3,683.96** |
+| 8 | Vect-Link CoW (Reassembled Fallback) | 12.80 | 462.31 | 524.46 | 3,683.10 |
+| 8 | `llama_memory_seq_cp` (1 proc, no isol) | 11.19 | 530.69 | 940.50 | 520.55 |
