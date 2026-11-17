@@ -1,134 +1,213 @@
 # Vect-Link
 
-Zero-dependency **C99** binary protocol, quantization codecs, and lock-free shared-memory IPC library for low-latency transport of tensors and latent/KV states between processes.
+**Git for LLM Context — A deterministic, zero-dependency C99 Copy-on-Write (CoW) KV-cache store and zero-copy IPC engine for multi-agent local LLMs.**
 
-## Highlights
+[![Language](https://img.shields.io/badge/C-C99-blue.svg)](#building--testing)
+[![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg)](#python-ffi--langgraph-integration)
+[![Platforms](https://img.shields.io/badge/Platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#architecture)
+[![Sanitizers](https://img.shields.io/badge/ASan%20%2B%20UBSan-Passing-brightgreen.svg)](#building--testing)
 
-- **64-byte Binary Wire Format:** Little-endian serialized `VTLK` header with Castagnoli **CRC32C** over header `[0..59]` and payload (`VTLK_QUANT_FP16`, `VTLK_QUANT_INT4_BLOCK`, `VTLK_QUANT_RAW`).
-- **Lock-Free SPSC Ring Buffer over OS Shared Memory:** Cache-line-isolated 192B control block with acquire/release atomic barriers (`CreateFileMappingA`/`MapViewOfFile` on Windows, `shm_open`/`mmap` on POSIX).
-- **Portable FP16 / INT4_BLOCK Codecs with Runtime AVX2 Dispatch:** Branchless `libm`-free C99 scalar fast-path plus translation-unit-isolated AVX2 acceleration (`src/codec/int4_avx2.c`) dispatched dynamically via `CPUID + XGETBV`, deterministic non-finite (`NaN`/`Inf`) sanitization, and bit-exact scalar/AVX2 parity.
-- **Zero-Copy Python Bindings (`python/vectlink`):** Dependency-free `ctypes` + `memoryview` wrapper over `vectlink_shared` (`vectlink.dll` / `libvectlink.so` / `libvectlink.dylib`), packaged with `scikit-build-core` (`pip install ./python`), featuring `WriteSlot` / `ReadSlot` context managers, dangling-view `BufferError` & `RingBusyError` guards, `to_numpy()`, and zero-copy NumPy interop ([python/README.md](python/README.md)).
-- **Real Multi-Process `llama.cpp` IPC Bridge (optional PoC):** Connects two independent `llama.cpp` processes over Vect-Link SHM with strict GGUF weight/metadata & KV-layout compatibility hashing ([examples/README_LLAMA.md](examples/README_LLAMA.md)):
-  - **`--mode kv-state`** (coherent continuation via sequence KV-Cache state transfer): `135,908 B` state + `16 B` `vtlk_llama_kv_meta_t`, **`106.80 us`** extract+commit and **`106.40 us`** acquire+restore (`~213 us` combined) with `v0.9.0` True Zero-Copy Slot Loan + SSE4.2 CRC32C on `qwen2.5-0.5b-instruct-q4_k_m.gguf`. In the two-process OS scaling benchmark (`benchmark_llama_multiprocess`, `n_ctx = 2304`, `threads = 4`), cross-process handoff scales from **16.10x** (`128` tokens: `364.21 ms` → `22.62 ms`) up to **184.49x p50 / 197.42x p99** (`2048` tokens, `25.19 MB` KV state: `7,366.57 ms` → `39.93 ms`) with exact Top-1 greedy token parity.
-  - **`--mode embd`** (INT4-quantized tensor transport & reconstruction benchmark): `11 x 896` FP32 -> `5,544 B` INT4 (**`7.11x`** compression), **`~44 us`** combined encode+push+pop+decode (`28.80 us` + `15.40 us`), **`0.985879`** cosine similarity *(demonstrates Layer-N post-RMSNorm vs Layer-0 `batch.embd` alignment requirement)*.
+Vect-Link eliminates redundant prefill computation and memory duplication when multiple processes or AI agents share context. Instead of serializing monolithic KV-cache blobs over sockets or disk, Vect-Link manages paged, immutable KV blocks in shared memory with atomic reference counting, instant `Snapshot / Fork / Restore` branching, and transparent L1/L2/L3 tiering.
 
-## Baseline Benchmarks (`v0.8.0` / `v0.5.1`)
+---
 
-Measured on **Intel Core i5-13500, 16 GB DDR4-3200, Windows x64, Clang 22.1.8 (`-O3 -march=native`)** transferring a `32 x 4096` hidden-state tensor (`131,072` floats = `524,288` bytes FP32) end-to-end (encode + transport + CRC32C + decode, warmup = 500, TCP `N = 2,000`, SHM `N = 10,000`):
+## Why Vect-Link?
 
-| Scenario | Wire Size (Bytes) | Compression vs JSON | p50 (us) | p95 (us) | p99 (us) | Throughput (msg/s) | Cosine Sim |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **JSON + TCP** | 1,114,216 | 1.00x | 32,845.70 | 33,794.80 | 35,076.20 | 30.6 | 1.000000 |
-| **VTLK INT4 + TCP** | 73,792 | 15.10x | 412.80 | 548.90 | 655.00 | 2,299.5 | 0.995645 |
-| **VTLK INT4 + SHM** | 73,792 | 15.10x | **376.20** | **395.10** | **484.80** | **2,616.0** | 0.995645 |
+When multiple agents share a long system prompt—or when a reasoning pipeline branches into parallel hypotheses (Tree-of-Thought, A/B critics, multi-agent exploration)—traditional inference setups either recompute the prefix per worker or copy tens of megabytes of KV state per branch.
 
-### Reproduce the Benchmarks in One Command
+Vect-Link separates the **Data Plane** (paged CoW shared memory arena) from the **Control Plane** (compact descriptor rings and native OS notifications):
 
-```sh
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/benchmark_codec && ./build/benchmark_transport
+* **Zero-Copy Branching (`Fork` in ~5.9 µs):** Forking a context duplicates only a lightweight table of block IDs (`block_ids[]`) and increments atomic reference counts (`refcount`). Tensor data is never copied.
+* **Bit-Exact RoPE Preservation:** Because all forked branches continue from exact token position $pos = N$, Rotary Position Embeddings (RoPE) remain 100% valid with **zero perplexity or logit degradation** (`max_logit_diff = 0.000000` verified against cold prefill).
+* **Strict Block Identity Contract:** Blocks are content-addressed and validated against the full model compatibility tuple—preventing silent corruption across mismatched models, RoPE configurations, quantization formats, or LoRA adapters.
+* **Zero External C Dependencies:** Pure C99 core with deterministic memory management, AVX2/SSE4.2 acceleration, and native cross-platform OS primitives (Linux, macOS & Windows).
+
+---
+
+## Architecture
+
+```text
++-----------------------------------------------------------------------+
+|                        ECOSYSTEM & BINDINGS                           |
+|   llama.cpp Paged Bridge   |   Python FFI (memoryview)   |  LangGraph |
++-----------------------------------------------------------------------+
+                                   |
+          +------------------------+------------------------+
+          v                                                 v
++-----------------------------------+   +-------------------------------+
+|          CONTROL PLANE            |   |          DATA PLANE           |
+|  - Descriptor Rings (vtlk_desc)   |   |  - Paged SHM Arena (CoW)      |
+|  - Protocol v2 (64-bit payloads)  |   |  - 128B Cache-Aligned Headers |
+|  - OS Wait/Wake (futex /          |   |  - Content-Addressed HashIdx  |
+|    WaitOnAddress)                 |   |  - Lock-Free ABA Free-List    |
++-----------------------------------+   +-------------------------------+
+                                                            |
+                                        +-------------------+-----------+
+                                        |   HIERARCHICAL TIERING (LRU)  |
+                                        |  L1: Shared Memory RAM        |
+                                        |  L2: Warm mmap / MapViewOfFile|
+                                        |  L3: Cold SSD + CRC32C Verify |
+                                        +-------------------------------+
 ```
 
-*(Outputs `benchmark_results.csv` in the current working directory. Disable native SIMD with `-DVTLK_ENABLE_NATIVE_SIMD=OFF` to benchmark the pure scalar C99 fast-path.)*
+### Core Subsystems
 
-## Two-Process `llama.cpp` KV-Cache Handoff (`v0.9.0` Zero-Copy + SSE4.2 CRC32C)
+1. **Paged CoW SHM Arena (`include/vectlink_kv.h`, `src/kv/`):**
+   * Fixed-size slab pages managed via a 32-bit ABA-tagged lock-free free-list (`((gen + 1) << 32) | block_id`).
+   * **128-byte (2 cache-line) block header (`vtlk_kv_block_header_t`):** Stores `token_prefix_hash`, `model_arch_hash`, `rope_config_hash`, `lora_adapter_hash`, `kv_dtype`, `layer_count`, `head_dim`, `kv_head_count`, `storage_format_version`, CRC32C checksum, and atomic `refcount`.
+   * Immutable once sealed: supports 1:N concurrent readers (*Broadcast*) without locks. `lru_stamp` is updated strictly on `1 -> 0` transitions to avoid read-path cache-line bouncing.
+2. **Hierarchical L1 / L2 / L3 Storage (`include/vectlink_tier.h`, `src/kv/kv_tier.c`):**
+   * **L1 (SHM RAM):** Immediate zero-copy pointer access.
+   * **L2 (Warm `mmap`):** Spills inactive (`refcount == 0`) blocks to memory-mapped files when L1 crosses its high watermark.
+   * **L3 (Cold SSD):** Persistent disk store with recoverable index (`vtlk_tier_index.bin`) and CRC32C validation upon transparent promotion back to L1 during `vtlk_kv_restore()` / `vtlk_kv_block_retain()`.
+3. **OS-Level Security & Synchronization (`include/vectlink_sync.h`, `src/sync/`):**
+   * Shared memory segments are created with strict per-user isolation (`0600` permissions + UID check on POSIX; user-SID restricted DACL on Windows).
+   * Replaces busy-spinning with `SYS_futex` (Linux) and `WaitOnAddress` (Windows).
+   * Preserves full ABI compatibility with v1 SPSC rings (`vtlk_ring_*`) alongside v2 64-bit payload headers (`vtlk_header_v2_t`).
 
-Measured across **two independent OS processes** (`benchmark_llama_multiprocess`, `qwen2.5-0.5b-instruct-q4_k_m.gguf`, `n_ctx = 2304`, `n_batch = 512`, `threads = 4`, `warmup = 3`, `iters = 15`, Clang 22.1.8 `-O3`):
+---
 
-| Tokens | KV Bytes | Re-Prefill p50 / p95 / p99 (ms) | Vect-Link p50 / p95 / p99 (ms) | Speedup p50 | Speedup p99 | Top-1 Match |
-| ---: | ---: | ---: | ---: | ---: | ---: | :--- |
-| **128** | 1,575,024 | 364.21 / 450.36 / 450.36 | **22.62 / 24.00 / 24.00** | 16.10x | 18.76x | EXACT (`10058`) |
-| **512** | 6,298,224 | 1,622.62 / 1,716.13 / 1,716.13 | **25.02 / 25.57 / 25.57** | 64.84x | 67.11x | EXACT (`3175`) |
-| **1024** | 12,595,824 | 3,381.13 / 3,692.37 / 3,692.37 | **30.19 / 30.59 / 30.59** | 111.99x | 120.72x | EXACT (`476`) |
-| **2048** | 25,191,024 | 7,366.57 / 8,006.97 / 8,006.97 | **39.93 / 40.56 / 40.56** | **184.49x** | **197.42x** | **EXACT (`1424`)** |
+## Benchmarks & Verification
 
-*(See [examples/README_LLAMA.md](examples/README_LLAMA.md) for `llama.cpp` setup, `--mode kv-state` vs `--mode embd`, and benchmark reproduction.)*
+### 1. CoW Branching Latency (9.77 MiB / 10,000-Token Context)
 
-## Architecture (`v0.1.0` – `v0.9.0+`)
+Measured via [benchmarks/bench_cow_git.c](benchmarks/bench_cow_git.c) and [benchmarks/bench_cow_git.py](benchmarks/bench_cow_git.py):
 
-- **Wire Format (`v0.1.0`+):** Fixed 64-byte `VTLK` header serialized via explicit little-endian offsets (zero struct-packing assumptions, zero dynamic allocations), supporting `VTLK_QUANT_FP16`, `VTLK_QUANT_INT4_BLOCK`, `VTLK_QUANT_RVQ10`, and `VTLK_QUANT_RAW`.
-- **Integrity (`v0.2.0`+):** Castagnoli **CRC32C** (`0x82F63B78`) over both header bytes `[0..59]` (`header_crc32c`) and payload (`payload_crc32c`), with runtime `CPUID`-dispatched hardware **SSE4.2** acceleration (`src/integrity/crc32c_sse42.c`) and portable C99 scalar fallback.
-- **IPC Transport (`v0.3.0`, `v0.9.0`):** Lock-free **SPSC Ring Buffer** over OS shared memory (`CreateFileMappingA`/`MapViewOfFile` on Windows, `shm_open`/`mmap` on POSIX) with 192-byte cache-line-isolated control block, acquire/release atomic barriers, and the **True Zero-Copy Slot Loan API** (`vtlk_ring_acquire_write`/`commit_write`/`abort_write`, `vtlk_ring_acquire_read`/`release_read`/`abort_read`, `vtlk_ring_close` with `VTLK_ERR_BUSY` loan protection).
-- **Tensor Codecs (`v0.4.0`–`v0.8.1`):** Portable IEEE 754 **FP16** (`2.0x`) and 32-element block-quantized **INT4_BLOCK** (`7.11x`, 18 bytes/block) with `libm`-free C99 scalar fast-path, `NaN`/`Inf` sanitization, and runtime **`CPUID + XGETBV` AVX2 dispatch** isolated in `src/codec/int4_avx2.c` (`-DVTLK_DISABLE_AVX2=ON` forces scalar fallback cleanly).
-- **Python Bindings (`v0.9.0`):** `ctypes` + `memoryview` wrapper over `vectlink_shared` (`vectlink.dll` / `libvectlink.so` / `libvectlink.dylib`) with `scikit-build-core` packaging, dangling-view `BufferError` guards, `to_numpy()`, and `10/10` unit/concurrency/hostile-input tests.
-- **Verification:** Compiled with `-std=c99 -Wall -Wextra -Werror -pedantic` (GCC/Clang) and `/TC /W4 /WX` (MSVC), tested in CI across Linux (`gcc`/`clang` + ASan/UBSan), Windows (`MSVC`), and macOS (`Clang`) including clean-`venv` Python packaging & tests.
+| Operation / Transport | Latency (p50) | Tensor Bytes Copied | Relative Speedup vs. Vect-Link |
+| :--- | :---: | :---: | :---: |
+| **Vect-Link C99 `restore`** | **0.50 µs** | **0 B** | Baseline (C99) |
+| **Vect-Link C99 `fork`** | **5.90 µs** | **0 B** | Baseline (C99) |
+| **Vect-Link C99 `snapshot_create`** | **6.30 µs** | **0 B** | Baseline (C99) |
+| **Vect-Link Python FFI CoW** | **0.015 ms** | **0 B** | **1.0×** |
+| Python `multiprocessing.shared_memory` | 0.517 ms | 9.77 MiB | 34.5× slower |
+| TCP Loopback Socket | 4.737 ms | 9.77 MiB | 315.8× slower |
+| SSD `mmap` + `os.fsync` | 42.550 ms | 9.77 MiB | 2,836.7× slower |
+
+### 2. End-to-End `llama.cpp` GGUF Validation
+
+Verified with [examples/llama_kv_paged_bridge.c](examples/llama_kv_paged_bridge.c) running **`qwen2.5-0.5b-instruct-q4_k_m.gguf`** with a shared 247-token system prompt (47 paged blocks = 3,038,708 bytes) forked into 3 independent agent branches (`Role A`, `Role B`, `Role C`) and compared against cold baseline runs from scratch:
+
+| Branch | Divergent Suffix | Token Match vs. Cold Prefill | Max Logit Difference |
+| :--- | :---: | :---: | :---: |
+| **Branch 0 (Researcher)** | 17 tokens | **16 / 16 (100%)** | `0.000000` |
+| **Branch 1 (Critic)** | 13 tokens | **16 / 16 (100%)** | `0.000000` |
+| **Branch 2 (Architect)** | 12 tokens | **16 / 16 (100%)** | `0.000000` |
+
+---
+
+## Quick Start
+
+### C99 CoW Snapshot & Fork API
+
+```c
+#include "vectlink_kv.h"
+
+/* 1. Producer seals a shared system prompt into an immutable snapshot */
+uint64_t snap_id = 0;
+vtlk_kv_snapshot_create(&arena, &base_branch, &snap_id);
+
+/* 2. Spawn 2 divergent agent branches in microseconds (0 tensor bytes copied) */
+vtlk_kv_branch_t branch_a, branch_b;
+vtlk_kv_fork(&arena, snap_id, &branch_a);
+vtlk_kv_fork(&arena, snap_id, &branch_b);
+
+/* 3. Each branch appends its own private KV pages without affecting siblings */
+vtlk_kv_branch_append_block(&arena, &branch_a, new_block_a);
+vtlk_kv_branch_append_block(&arena, &branch_b, new_block_b);
+
+/* 4. Zero-copy restore validates model/RoPE/LoRA/dtype hashes before access */
+const void *ptrs[VTLK_KV_MAX_BRANCH_BLOCKS];
+vtlk_kv_restore(&arena, snap_id, &expected_cfg, &branch_a, ptrs, VTLK_KV_MAX_BRANCH_BLOCKS);
+
+/* 5. Atomic refcount release returns unused pages to the free-list / LRU tier */
+vtlk_kv_branch_release(&arena, &branch_a);
+vtlk_kv_branch_release(&arena, &branch_b);
+```
+
+### Python FFI & LangGraph Integration
+
+```python
+from vectlink.kv import KVArena, KVIdentity, KVDtype
+from vectlink.integrations.langgraph import VectLinkBranchStore
+
+with KVArena.create("/vtlk_llm_ctx", num_blocks=1024, block_size_bytes=65536) as arena:
+    store = VectLinkBranchStore(arena)
+
+    # Commit shared base context once
+    root = store.commit_root(
+        thread_id="tot-session-1",
+        checkpoint_id="root",
+        block_ids=base_block_ids,
+        identity=model_identity,
+    )
+
+    # Fork independent reasoning branches (Tree-of-Thought) with zero-copy memoryviews
+    with store.fork_branch(root.checkpoint_id) as branch_researcher:
+        with arena.block_view(branch_researcher.block_ids[0]) as view:
+            prefix_bytes = view.buffer  # Zero-copy memoryview
+        # Append divergent blocks...
+
+    with store.fork_branch(root.checkpoint_id) as branch_critic:
+        # Explore alternative hypothesis in parallel...
+        pass
+```
+
+---
+
+## Building & Testing
+
+### C99 Core & Multi-Process Stress Suites
+
+```bash
+# Release build (compiles with -std=c99 -Wall -Wextra -Werror -pedantic)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+
+# AddressSanitizer + UndefinedBehaviorSanitizer build
+cmake -B build-san -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+cmake --build build-san -j
+ctest --test-dir build-san --output-on-failure
+```
+
+### Python FFI & Benchmarks
+
+```bash
+# Install Python package and run unit tests
+pip install ./python
+python -m unittest discover -s python/tests -v
+
+# Run C99 and Python CoW benchmarks
+./build/bench_cow_git
+python benchmarks/bench_cow_git.py
+```
+
+---
 
 ## Repository Layout
 
 ```text
-include/vectlink/
-  vectlink.h      # Umbrella public header
-  protocol.h      # VTLK 64-byte header types, status codes, encode/decode API
-  checksum.h      # CRC32C Castagnoli API
-  codec.h         # FP16 & INT4_BLOCK tensor codecs + cosine similarity metrics
-  transport.h     # Lock-free SPSC ring buffer & OS shared memory API
-src/
-  integrity/      # crc32c.c, crc32c_sse42.c, crc32c_internal.h
-  protocol/       # endian.h, header.c
-  codec/          # fp16.c, int4.c, int4_avx2.c, codec.c
-  transport/      # atomic_compat.h, ring_buffer.c, shm_windows.c, shm_posix.c
-tests/
-  test_protocol.c
-  test_ring_buffer.c
-  test_cross_process.c
-  test_codec.c
-benchmarks/
-  bench_timer.h
-  benchmark_codec.c
-  benchmark_transport.c
-examples/
-  agent_sender.c
-  agent_receiver.c
-  llama_bridge_common.h
-  llama_agent_a.c
-  llama_agent_b.c
-  benchmark_llama_handoff.c
-  benchmark_llama_multiprocess.c
-  README_LLAMA.md
-python/
-  pyproject.toml
-  README.md
-  vectlink/       # _ffi.py, ring.py, __init__.py
-  tests/          # test_vectlink_python.py
-  examples/       # two_agents_zero_copy.py
+├── include/
+│   ├── vectlink/protocol.h        # Wire protocol v1 & v2 (64-bit payload headers)
+│   ├── vectlink_kv.h              # CoW Arena, block identity, snapshot/fork/restore API
+│   ├── vectlink_sync.h            # OS wait/wake (futex / WaitOnAddress) & descriptor ring
+│   └── vectlink_tier.h            # L1 (SHM) -> L2 (mmap) -> L3 (SSD) LRU tiering engine
+├── src/
+│   ├── kv/                        # kv_arena.c, kv_cow.c, kv_hash.c, kv_tier.c
+│   ├── sync/                      # os_notify_posix.c, os_notify_windows.c, desc_ring.c
+│   └── transport/                 # SPSC ring, atomic_compat.h, POSIX/Windows SHM ACLs
+├── python/vectlink/
+│   ├── kv.py                      # Zero-copy Python FFI wrapper (memoryview + BufferError)
+│   └── integrations/langgraph.py  # VectLinkBranchStore & VectLinkCheckpointer
+├── examples/
+│   └── llama_kv_paged_bridge.c    # Paged KV-cache bridge & GGUF bit-exact verifier
+├── tests/                         # Unit tests, multi-process CoW stress tests & fixtures
+└── benchmarks/                    # bench_cow_git.c & bench_cow_git.py
 ```
 
-## Build & Run Tests (CMake + Ninja)
-
-```sh
-cmake -S . -B build -G Ninja
-cmake --build build
-ctest --test-dir build --output-on-failure
-```
-
-### Strict C99 + Sanitizers (Clang / GCC)
-
-```sh
-cmake -S . -B build-san -G Ninja -DCMAKE_C_COMPILER=clang \
-  -DCMAKE_C_FLAGS="-O2 -g -fsanitize=address,undefined"
-cmake --build build-san
-ctest --test-dir build-san --output-on-failure
-```
-
-### Python Package & Tests (`scikit-build-core`)
-
-```sh
-pip install ./python
-python -m unittest discover -s python/tests -v
-python python/examples/two_agents_zero_copy.py
-```
-
-### Two-Process Shared Memory Demo (C99)
-
-Terminal 1:
-```sh
-./build/agent_sender
-```
-
-Terminal 2:
-```sh
-./build/agent_receiver
-```
+---
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE) for details.
