@@ -92,3 +92,43 @@ Vect-Link evolucionó de un transporte IPC SPSC lineal a un motor de almacenamie
   1. Correr la suite completa + TSan/ASan/UBSan en CI Linux para ejercitar en vivo `shm_posix.c` (`0600` + UID) y `os_notify_posix.c` (`SYS_futex`).
   2. Probar `llama_kv_paged_bridge` contra un modelo GGUF real en dos procesos OS separados midiendo tokens/s y paridad Top-1 tras `fork` en `pos = N`.
   3. Añadir cuantización asimétrica específica de KV-cache (estilo KIVI 2-bit/4-bit) y soporte CUDA IPC / `dmabuf` para GPU-direct CoW.
+
+
+---
+
+## 5. Endurecimiento Pre-Release (`feat/pre-release-hardening`)
+
+### 5.1 Bridge Zero-Copy (`examples/llama_kv_paged_bridge.c`)
+- Eliminado el header intercalado por página (`bridge_page_header_t`) y cualquier `malloc` / doble copia en `restore`: la metadata por página reside out-of-band en `vtlk_kv_block_header_t.reserved_imm` y `vtlk_kv_branch_t.total_tokens`.
+- `prepare_restore_view()` verifica contigüidad de las páginas mapeadas en SHM (`ptrs[i] == ptrs[i-1] + aligned_blk`) y entrega `(const uint8_t *)ptrs[0]` directo a `llama_state_seq_set_data()` (`mapped_zero_copy_bytes == 1,390,508 B`, `copied_bytes == 0`, `restore_heap_allocs == 0`).
+- Validación GGUF real (`qwen2.5-0.5b-instruct-q4_k_m.gguf`, 113 tokens, 22 bloques): `token_match = 16/16 (100%)` y `max_logit_diff = 0.000000` en las 3 ramas divergentes.
+
+### 5.2 Índice Persistente DAG en C/L3 y `VectLinkCheckpointer` Real
+- **C99 (`include/vectlink_kv.h`, `src/kv/kv_dag.c`):** `vtlk_kv_dag_t` y `vtlk_kv_checkpoint_meta_t` con `vtlk_kv_dag_open`, `vtlk_kv_dag_close`, `vtlk_kv_dag_put`, `vtlk_kv_dag_get`, `vtlk_kv_dag_list`. Persistencia atómica con lock de archivo OS (`LockFileEx` / `flock`), archivos temporales por PID + rename atómico (`MoveFileExA` / `rename`), e índice `vtlk_dag_index.bin` + `.ckpt` protegidos por CRC32C.
+- **Python / LangGraph (`python/vectlink/_ffi.py`, `python/vectlink/integrations/langgraph.py`, `python/pyproject.toml`):** `VectLinkBranchStore` y `VectLinkCheckpointer` reconstruyen todo el DAG y `pending_writes` desde C/L3 sin diccionarios volátiles en memoria.
+- **Tests reales sin mocks (`.venv-test`, `langgraph==1.2.22`, `langgraph-checkpoint==4.3.2`, `pytest==9.2.0`):**
+  - `pytest python/tests/test_langgraph_real.py -v`: **`3 passed in 7.70s`** (`test_real_langgraph_send_cow_fanout`, `test_process_restart_survival_without_recompute` tras `os._exit(0)`, `test_multiprocess_concurrent_checkpoint_writes` con 4 procesos).
+  - `ctest --test-dir build`: **`5/5` passed (`0.40s`)**.
+  - `ctest --test-dir build-san` (ASan + UBSan): **`5/5` passed (`1.30s`)**.
+  - `python -m unittest discover -s python/tests -v` (entorno base sin `langgraph`): **`16` tests (`15` passed, `1` skipped `test_langgraph_real`)**.
+
+### 5.3 Benchmarks Apples-to-Apples (`benchmarks/bench_llama_cow_apples.c`, `qwen2.5-0.5b-instruct-q4_k_m.gguf`, 242 tokens, KV = 2.84 MiB)
+
+| N | Method | Pure Fork/Load (µs) | TTFT Mean (ms) | TTFT Max (ms) | Total System RSS (MiB) |
+|---:|:---|---:|---:|---:|---:|
+| 1 | Cold Prefill (N procs) | 0.00 | 1,362.44 | 1,362.44 | 474.70 |
+| 1 | `llama_state_seq_load_file` (N procs) | 3,399.90 | 209.72 | 209.72 | 457.46 |
+| 1 | **Vect-Link CoW (N procs, SHM Arena)** | **5.40** | **169.97** | **169.97** | **460.40** |
+| 1 | `llama_memory_seq_cp` (1 proc, no isol) | 0.00 | 137.93 | 137.93 | 492.01 |
+| 2 | Cold Prefill (N procs) | 0.00 | 1,557.08 | 1,562.83 | 949.26 |
+| 2 | `llama_state_seq_load_file` (N procs) | 3,997.20 | 205.01 | 206.25 | 914.79 |
+| 2 | **Vect-Link CoW (N procs, SHM Arena)** | **6.70** | **241.95** | **252.58** | **920.84** |
+| 2 | `llama_memory_seq_cp` (1 proc, no isol) | 22.30 | 225.17 | 310.37 | 495.61 |
+| 4 | Cold Prefill (N procs) | 0.00 | 3,342.85 | 3,497.25 | 1,898.45 |
+| 4 | `llama_state_seq_load_file` (N procs) | 5,389.97 | 369.48 | 405.50 | 1,830.14 |
+| 4 | **Vect-Link CoW (N procs, SHM Arena)** | **10.78** | **363.90** | **385.03** | **1,841.50** |
+| 4 | `llama_memory_seq_cp` (1 proc, no isol) | 14.30 | 341.38 | 541.65 | 503.01 |
+| 8 | Cold Prefill (N procs) | 0.00 | 4,626.76 | 4,826.23 | 3,796.82 |
+| 8 | `llama_state_seq_load_file` (N procs) | 9,132.17 | 478.79 | 539.66 | 3,660.21 |
+| 8 | **Vect-Link CoW (N procs, SHM Arena)** | **22.94** | **497.59** | **559.61** | **3,683.19** |
+| 8 | `llama_memory_seq_cp` (1 proc, no isol) | 11.80 | 549.96 | 998.80 | 520.21 |
