@@ -257,6 +257,7 @@ class VtlkKvArena(ctypes.Structure):
         ("snapshots_offset", ctypes.c_uint64),
         ("block_headers_offset", ctypes.c_uint64),
         ("block_data_offset", ctypes.c_uint64),
+        ("tier", ctypes.c_void_p),
     ]
 
 

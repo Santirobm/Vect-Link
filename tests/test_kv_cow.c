@@ -640,6 +640,63 @@ static int run_multiproc_cow_stress(const char *exe_path)
     return 0;
 }
 
+static void test_arena_tier_transparent_restore(void)
+{
+    const char *shm_name = "/vtlk_test_arena_tier_sync";
+    const char *l2_path = "vtlk_test_arena_l2.bin";
+    const char *l3_dir = "vtlk_test_arena_l3_dir";
+    vtlk_kv_arena_t arena;
+    vtlk_tier_store_t tier;
+    vtlk_tier_config_t cfg;
+    uint8_t l1_mem[4u * 1024u];
+    uint32_t bid = 0u;
+    vtlk_kv_identity_t id;
+    uint8_t *bdata;
+    vtlk_kv_block_header_t *hdr;
+    uint32_t demoted = 0u;
+    uint32_t tok = 777u;
+
+    (void)vtlk_shm_unlink(shm_name);
+    remove(l2_path);
+    assert(vtlk_kv_arena_create(&arena, shm_name, 8u, 1024u) == VTLK_OK);
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.block_size = 1024u;
+    cfg.l1_capacity = 4u;
+    cfg.l2_capacity = 4u;
+    cfg.max_blocks = 8u;
+    cfg.high_watermark = 4u;
+    cfg.l1_mem = l1_mem;
+    cfg.l2_path = l2_path;
+    cfg.l3_dir = l3_dir;
+    assert(vtlk_tier_init(&tier, &cfg) == VTLK_OK);
+    assert(vtlk_kv_arena_attach_tier(&arena, &tier) == VTLK_OK);
+
+    id = make_base_identity(vtlk_kv_hash_tokens(0u, &tok, 1u), 0u, 16u);
+    assert(vtlk_kv_block_alloc(&arena, &bid) == VTLK_OK);
+    bdata = (uint8_t *)vtlk_kv_block_data(&arena, bid);
+    fill_kv_pattern(bdata, 1024u, 42u, bid);
+    assert(vtlk_kv_block_seal(&arena, bid, &id) == VTLK_OK);
+    assert(vtlk_kv_block_release(&arena, bid) == VTLK_OK);
+
+    assert(vtlk_kv_arena_demote_lru(&arena, 1u, &demoted) == VTLK_OK);
+    assert(demoted == 1u);
+    hdr = vtlk_kv_block_header(&arena, bid);
+    assert((hdr->flags & (VTLK_KV_FLAG_TIER_L2 | VTLK_KV_FLAG_TIER_L3)) != 0u);
+
+    /* Wipe L1 buffer to prove retain/restore promotes from L2/L3 -> L1 */
+    memset(bdata, 0, 1024u);
+    assert(vtlk_kv_block_retain(&arena, bid) == VTLK_OK);
+    assert((hdr->flags & (VTLK_KV_FLAG_TIER_L2 | VTLK_KV_FLAG_TIER_L3)) == 0u);
+    assert(verify_kv_pattern(bdata, 1024u, 42u, bid));
+    assert(vtlk_kv_block_release(&arena, bid) == VTLK_OK);
+
+    vtlk_tier_close(&tier);
+    vtlk_kv_arena_close(&arena);
+    (void)vtlk_shm_unlink(shm_name);
+    remove(l2_path);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 5 && strcmp(argv[1], "--worker") == 0) {
@@ -651,6 +708,7 @@ int main(int argc, char **argv)
     test_kv_snapshot_fork_restore_mismatch();
     test_desc_ring_and_notify();
     test_tier_l1_l2_l3_persistence();
+    test_arena_tier_transparent_restore();
     printf("All KV/Sync/Tier unit tests passed.\n");
 
     return run_multiproc_cow_stress(argv[0]);

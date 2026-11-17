@@ -1,4 +1,5 @@
 #include "vectlink_kv.h"
+#include "vectlink_tier.h"
 #include "vectlink/checksum.h"
 #include "transport/atomic_compat.h"
 
@@ -479,6 +480,96 @@ vtlk_status_t vtlk_kv_arena_stats(const vtlk_kv_arena_t *arena,
     return VTLK_OK;
 }
 
+vtlk_status_t vtlk_kv_arena_attach_tier(vtlk_kv_arena_t *arena,
+                                        struct vtlk_tier_store *tier)
+{
+    if (arena == NULL) {
+        return VTLK_ERR_NULL_PTR;
+    }
+    if (arena->base == NULL) {
+        return VTLK_ERR_INVALID_PARAM;
+    }
+    arena->tier = tier;
+    return VTLK_OK;
+}
+
+vtlk_status_t vtlk_kv_arena_demote_lru(vtlk_kv_arena_t *arena,
+                                       uint32_t max_demote,
+                                       uint32_t *out_demoted)
+{
+    uint32_t demoted = 0u;
+    uint32_t step;
+
+    if (arena == NULL) {
+        return VTLK_ERR_NULL_PTR;
+    }
+    if (arena->base == NULL || arena->tier == NULL) {
+        return VTLK_ERR_INVALID_PARAM;
+    }
+
+    for (step = 0u; step < max_demote; ++step) {
+        uint32_t best_id = VTLK_KV_INVALID_BLOCK_ID;
+        uint64_t best_lru = UINT64_MAX;
+        uint32_t i;
+
+        for (i = 0u; i < arena->num_blocks; ++i) {
+            vtlk_kv_block_header_t *hdr = vtlk_kv_block_header(arena, i);
+            uint32_t flags = vtlk_atomic_load_acquire_u32(&hdr->flags);
+            if ((flags & VTLK_KV_FLAG_IMMUTABLE) != 0u &&
+                (flags & VTLK_KV_FLAG_EVICTABLE) != 0u &&
+                (flags & (VTLK_KV_FLAG_TIER_L2 | VTLK_KV_FLAG_TIER_L3)) == 0u &&
+                vtlk_atomic_load_acquire_u32(&hdr->refcount) == 0u) {
+                uint64_t stamp = vtlk_atomic_load_acquire_u64(&hdr->lru_stamp);
+                if (best_id == VTLK_KV_INVALID_BLOCK_ID || stamp < best_lru) {
+                    best_id = i;
+                    best_lru = stamp;
+                }
+            }
+        }
+
+        if (best_id == VTLK_KV_INVALID_BLOCK_ID) {
+            break;
+        }
+
+        {
+            vtlk_kv_block_header_t *hdr = vtlk_kv_block_header(arena, best_id);
+            uint32_t flags = vtlk_atomic_load_acquire_u32(&hdr->flags);
+            const void *data = vtlk_kv_block_data(arena, best_id);
+            vtlk_status_t st;
+
+            if (vtlk_atomic_load_acquire_u32(&hdr->refcount) != 0u) {
+                continue;
+            }
+            st = vtlk_tier_put(arena->tier, best_id, data,
+                               (size_t)arena->block_size_bytes);
+            if (st != VTLK_OK) {
+                if (out_demoted != NULL) {
+                    *out_demoted = demoted;
+                }
+                return st;
+            }
+            /* Re-verify refcount == 0 before marking as tiered out of L1 */
+            if (vtlk_atomic_load_acquire_u32(&hdr->refcount) == 0u) {
+                uint32_t tier_flag = VTLK_KV_FLAG_TIER_L2;
+                if (best_id < arena->tier->max_blocks &&
+                    arena->tier->blocks[best_id].tier == VTLK_TIER_L3) {
+                    tier_flag = VTLK_KV_FLAG_TIER_L3;
+                    hdr->tier_state = VTLK_TIER_L3;
+                } else {
+                    hdr->tier_state = VTLK_TIER_L2;
+                }
+                vtlk_atomic_store_release_u32(&hdr->flags, flags | tier_flag);
+                demoted++;
+            }
+        }
+    }
+
+    if (out_demoted != NULL) {
+        *out_demoted = demoted;
+    }
+    return VTLK_OK;
+}
+
 vtlk_kv_block_header_t *vtlk_kv_block_header(vtlk_kv_arena_t *arena,
                                              uint32_t block_id)
 {
@@ -672,7 +763,6 @@ vtlk_status_t vtlk_kv_block_lookup(vtlk_kv_arena_t *arena,
 
 vtlk_status_t vtlk_kv_block_retain(vtlk_kv_arena_t *arena, uint32_t block_id)
 {
-    vtlk_kv_shm_ctrl_t *ctrl;
     vtlk_kv_block_header_t *hdr;
 
     if (arena == NULL) {
@@ -682,8 +772,6 @@ vtlk_status_t vtlk_kv_block_retain(vtlk_kv_arena_t *arena, uint32_t block_id)
     if (hdr == NULL) {
         return VTLK_ERR_INVALID_PARAM;
     }
-
-    ctrl = vtlk_kv_ctrl(arena);
 
     for (;;) {
         uint32_t flags = vtlk_atomic_load_acquire_u32(&hdr->flags);
@@ -695,13 +783,40 @@ vtlk_status_t vtlk_kv_block_retain(vtlk_kv_arena_t *arena, uint32_t block_id)
 
         rc = vtlk_atomic_load_acquire_u32(&hdr->refcount);
         if (vtlk_atomic_cas_u32(&hdr->refcount, &rc, rc + 1u)) {
-            if (vtlk_atomic_load_acquire_u32(&hdr->flags) == 0u) {
+            uint32_t cur_flags = vtlk_atomic_load_acquire_u32(&hdr->flags);
+            if (cur_flags == 0u) {
                 vtlk_atomic_fetch_sub_u32(&hdr->refcount, 1u);
                 return VTLK_ERR_EMPTY;
             }
-            vtlk_atomic_store_release_u64(
-                &hdr->lru_stamp,
-                vtlk_atomic_fetch_add_u64(&ctrl->lru_clock, 1u) + 1u);
+            /* Transparently promote from L2/L3 -> L1 if demoted while unpinned */
+            if ((cur_flags & (VTLK_KV_FLAG_TIER_L2 | VTLK_KV_FLAG_TIER_L3)) != 0u) {
+                if (arena->tier == NULL) {
+                    vtlk_atomic_fetch_sub_u32(&hdr->refcount, 1u);
+                    return VTLK_ERR_NOT_FOUND;
+                }
+                {
+                    const void *promoted_ptr = NULL;
+                    vtlk_status_t pst = vtlk_tier_acquire(arena->tier, block_id,
+                                                          &promoted_ptr);
+                    if (pst != VTLK_OK) {
+                        vtlk_atomic_fetch_sub_u32(&hdr->refcount, 1u);
+                        return pst;
+                    }
+                    void *dst = vtlk_kv_block_data(arena, block_id);
+                    if (dst != NULL && promoted_ptr != NULL && dst != promoted_ptr) {
+                        memcpy(dst, promoted_ptr, (size_t)arena->block_size_bytes);
+                    }
+                    (void)vtlk_tier_release(arena->tier, block_id);
+                    hdr->tier_state = VTLK_TIER_L1;
+                    vtlk_atomic_store_release_u32(
+                        &hdr->flags,
+                        cur_flags & ~(uint32_t)(VTLK_KV_FLAG_TIER_L2 |
+                                                VTLK_KV_FLAG_TIER_L3));
+                }
+            }
+            /* Note: lru_stamp is intentionally NOT updated on retain/read to
+             * avoid cross-process cache-line bouncing on the hot read path;
+             * it is updated when refcount transitions 1 -> 0 in release(). */
             return VTLK_OK;
         }
     }

@@ -353,10 +353,36 @@ static int run_self_test(uint32_t num_workers)
     return 0;
 }
 
+static llama_token greedy_next_token(struct llama_context *ctx,
+                                     int32_t n_vocab,
+                                     const float **out_logits)
+{
+    const float *logits = llama_get_logits_ith(ctx, -1);
+    int32_t best_id = 0;
+    float best_val = logits[0];
+    for (int32_t i = 1; i < n_vocab; ++i) {
+        if (logits[i] > best_val) {
+            best_val = logits[i];
+            best_id = i;
+        }
+    }
+    if (out_logits != NULL) {
+        *out_logits = logits;
+    }
+    return (llama_token)best_id;
+}
+
 static int run_llama_model_mode(const char *model_path,
                                 const char *prompt,
                                 uint32_t num_workers)
 {
+    static const char *const branch_suffixes[3] = {
+        "\n\nRole A (Researcher): Summarize the core invariant concisely:",
+        "\n\nRole B (Critic): Identify the main failure mode:",
+        "\n\nRole C (Architect): Propose an optimization:"
+    };
+    const uint32_t gen_len = 16u;
+
     struct llama_model_params mparams = llama_model_default_params();
     struct llama_model *model = llama_model_load_from_file(model_path, mparams);
     if (model == NULL) {
@@ -365,10 +391,11 @@ static int run_llama_model_mode(const char *model_path,
     }
 
     const struct llama_vocab *vocab = llama_model_get_vocab(model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     int32_t n_tok = -llama_tokenize(vocab, prompt, (int32_t)strlen(prompt),
                                     NULL, 0, true, true);
-    if (n_tok <= 0) {
-        fprintf(stderr, "Tokenization failed\n");
+    if (n_tok <= 1) {
+        fprintf(stderr, "Tokenization failed or too short\n");
         llama_model_free(model);
         return 1;
     }
@@ -383,8 +410,10 @@ static int run_llama_model_mode(const char *model_path,
     }
 
     struct llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx = (uint32_t)(n_tok + 64);
-    cparams.n_batch = (uint32_t)n_tok;
+    cparams.n_ctx = (uint32_t)(n_tok + 128);
+    cparams.n_batch = (uint32_t)(n_tok + 64);
+    cparams.n_threads = 4;
+    cparams.n_threads_batch = 4;
 
     struct llama_context *ctx = llama_init_from_model(model, cparams);
     if (ctx == NULL) {
@@ -477,48 +506,147 @@ static int run_llama_model_mode(const char *model_path,
         llama_model_free(model);
         return 1;
     }
+    uint32_t paged_blocks = root_branch.block_count;
     vtlk_kv_branch_release(&arena, &root_branch);
 
-    printf("[producer] prefill pos=%d, state=%zu B, snapshot_id=%llu\n",
-           n_tok, state_size, (unsigned long long)snap_id);
+    printf("[producer] prefill pos=%d, state=%zu B (%u paged blocks), snapshot_id=%llu\n",
+           n_tok, state_size, paged_blocks, (unsigned long long)snap_id);
 
+    int all_exact = 1;
     for (uint32_t w = 0; w < num_workers; ++w) {
-        vtlk_kv_branch_t forked;
-        const void *ptrs[VTLK_KV_MAX_BRANCH_BLOCKS];
-        if (vtlk_kv_fork(&arena, snap_id, &forked) != VTLK_OK) {
+        const char *suf = branch_suffixes[w % 3u];
+        int32_t n_suf = -llama_tokenize(vocab, suf, (int32_t)strlen(suf),
+                                        NULL, 0, false, true);
+        llama_token *suf_toks = (llama_token *)malloc((size_t)n_suf * sizeof(llama_token));
+        if (suf_toks == NULL ||
+            llama_tokenize(vocab, suf, (int32_t)strlen(suf),
+                           suf_toks, n_suf, false, true) < 0) {
+            free(suf_toks);
+            all_exact = 0;
             break;
         }
-        vtlk_kv_branch_release(&arena, &forked);
 
+        /* 1) Baseline from scratch (prefill 0..n_tok-1, then decode suffix n_tok..n_tok+n_suf-1) */
+        llama_token base_gen[16];
+        float *base_logits = (float *)malloc((size_t)n_vocab * sizeof(float));
+        {
+            struct llama_context *bctx = llama_init_from_model(model, cparams);
+            struct llama_batch bb0 = llama_batch_init(n_tok, 0, 1);
+            bb0.n_tokens = n_tok;
+            for (int32_t i = 0; i < n_tok; ++i) {
+                bb0.token[i] = tokens[i];
+                bb0.pos[i] = (llama_pos)i;
+                bb0.n_seq_id[i] = 1;
+                bb0.seq_id[i][0] = 0;
+                bb0.logits[i] = 0;
+            }
+            llama_decode(bctx, bb0);
+            llama_batch_free(bb0);
+
+            struct llama_batch bb = llama_batch_init(n_suf, 0, 1);
+            bb.n_tokens = n_suf;
+            for (int32_t i = 0; i < n_suf; ++i) {
+                bb.token[i] = suf_toks[i];
+                bb.pos[i] = (llama_pos)(n_tok + i);
+                bb.n_seq_id[i] = 1;
+                bb.seq_id[i][0] = 0;
+                bb.logits[i] = (i == n_suf - 1) ? 1 : 0;
+            }
+            llama_decode(bctx, bb);
+            llama_batch_free(bb);
+
+            const float *bl0 = NULL;
+            base_gen[0] = greedy_next_token(bctx, n_vocab, &bl0);
+            memcpy(base_logits, bl0, (size_t)n_vocab * sizeof(float));
+
+            for (uint32_t g = 1; g < gen_len; ++g) {
+                struct llama_batch gb = llama_batch_init(1, 0, 1);
+                gb.n_tokens = 1;
+                gb.token[0] = base_gen[g - 1];
+                gb.pos[0] = (llama_pos)(n_tok + n_suf + (int32_t)g - 1);
+                gb.n_seq_id[0] = 1;
+                gb.seq_id[0][0] = 0;
+                gb.logits[0] = 1;
+                llama_decode(bctx, gb);
+                llama_batch_free(gb);
+                base_gen[g] = greedy_next_token(bctx, n_vocab, NULL);
+            }
+            llama_free(bctx);
+        }
+
+        /* 2) Vect-Link CoW Fork + Restore at pos = n_tok */
+        vtlk_kv_branch_t forked;
+        const void *ptrs[VTLK_KV_MAX_BRANCH_BLOCKS];
         if (vtlk_kv_restore(&arena, snap_id, &expected_cfg, &forked,
                             ptrs, VTLK_KV_MAX_BRANCH_BLOCKS) != VTLK_OK) {
+            free(base_logits);
+            free(suf_toks);
+            all_exact = 0;
             break;
         }
 
         uint8_t *w_state = NULL;
         size_t w_bytes = 0;
         uint32_t w_pos = 0;
+        llama_token cow_gen[16];
+        double max_logit_diff = 0.0;
+        uint32_t exact_tokens = 0u;
+
         if (reassemble_state_from_ptrs(ptrs, forked.block_count, forked.block_count,
                                        &w_state, &w_bytes, &w_pos) == 0) {
             struct llama_context *wctx = llama_init_from_model(model, cparams);
-            if (wctx != NULL) {
-                size_t loaded = llama_state_seq_set_data(wctx, w_state, w_bytes, 0);
-                struct llama_batch wbatch = llama_batch_init(1, 0, 1);
-                wbatch.n_tokens = 1;
-                wbatch.token[0] = tokens[n_tok - 1];
-                wbatch.pos[0] = (llama_pos)w_pos;
-                wbatch.n_seq_id[0] = 1;
-                wbatch.seq_id[0][0] = 0;
-                wbatch.logits[0] = 1;
-                int dec = llama_decode(wctx, wbatch);
-                printf("[worker %u] restored %zu B at pos=%u, decode_next=%d\n",
-                       w, loaded, w_pos, dec);
-                llama_batch_free(wbatch);
-                llama_free(wctx);
+            llama_state_seq_set_data(wctx, w_state, w_bytes, 0);
+
+            struct llama_batch wb = llama_batch_init(n_suf, 0, 1);
+            wb.n_tokens = n_suf;
+            for (int32_t i = 0; i < n_suf; ++i) {
+                wb.token[i] = suf_toks[i];
+                wb.pos[i] = (llama_pos)(w_pos + (uint32_t)i);
+                wb.n_seq_id[i] = 1;
+                wb.seq_id[i][0] = 0;
+                wb.logits[i] = (i == n_suf - 1) ? 1 : 0;
             }
+            llama_decode(wctx, wb);
+            llama_batch_free(wb);
+
+            const float *cl0 = NULL;
+            cow_gen[0] = greedy_next_token(wctx, n_vocab, &cl0);
+            for (int32_t v = 0; v < n_vocab; ++v) {
+                double d = (double)cl0[v] - (double)base_logits[v];
+                if (d < 0.0) d = -d;
+                if (d > max_logit_diff) max_logit_diff = d;
+            }
+
+            for (uint32_t g = 1; g < gen_len; ++g) {
+                struct llama_batch gb = llama_batch_init(1, 0, 1);
+                gb.n_tokens = 1;
+                gb.token[0] = cow_gen[g - 1];
+                gb.pos[0] = (llama_pos)(n_tok + n_suf + (int32_t)g - 1);
+                gb.n_seq_id[0] = 1;
+                gb.seq_id[0][0] = 0;
+                gb.logits[0] = 1;
+                llama_decode(wctx, gb);
+                llama_batch_free(gb);
+                cow_gen[g] = greedy_next_token(wctx, n_vocab, NULL);
+            }
+
+            for (uint32_t g = 0; g < gen_len; ++g) {
+                if (cow_gen[g] == base_gen[g]) {
+                    exact_tokens++;
+                }
+            }
+            if (exact_tokens != gen_len) {
+                all_exact = 0;
+            }
+            printf("[branch %u] suffix_toks=%d | token_match=%u/%u | max_logit_diff=%.6f\n",
+                   w, n_suf, exact_tokens, gen_len, max_logit_diff);
+
+            llama_free(wctx);
             free(w_state);
         }
         vtlk_kv_branch_release(&arena, &forked);
+        free(base_logits);
+        free(suf_toks);
     }
 
     vtlk_kv_arena_close(&arena);
@@ -527,7 +655,7 @@ static int run_llama_model_mode(const char *model_path,
     llama_free(ctx);
     free(tokens);
     llama_model_free(model);
-    return 0;
+    return all_exact ? 0 : 1;
 }
 
 int main(int argc, char **argv)

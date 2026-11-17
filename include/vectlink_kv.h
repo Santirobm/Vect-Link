@@ -168,6 +168,8 @@ typedef struct vtlk_kv_branch {
 /**
  * @brief Arena runtime handle (process-local view over SHM).
  */
+struct vtlk_tier_store;
+
 typedef struct vtlk_kv_arena {
     vtlk_shm_t shm;
     uint8_t *base;
@@ -182,6 +184,7 @@ typedef struct vtlk_kv_arena {
     uint64_t snapshots_offset;
     uint64_t block_headers_offset;
     uint64_t block_data_offset;
+    struct vtlk_tier_store *tier;
 } vtlk_kv_arena_t;
 
 /**
@@ -256,6 +259,25 @@ VTLK_API void vtlk_kv_arena_close(vtlk_kv_arena_t *arena);
  */
 VTLK_API vtlk_status_t vtlk_kv_arena_stats(const vtlk_kv_arena_t *arena,
                                            vtlk_kv_arena_stats_t *out_stats);
+
+/**
+ * @brief Attaches an optional hierarchical L1/L2/L3 tier store to the arena.
+ *
+ * When attached, LRU demotion spills unpinned (refcount == 0) blocks to L2/L3,
+ * and vtlk_kv_restore() / vtlk_kv_block_retain() transparently promote them
+ * back to L1 with CRC32C verification.
+ */
+VTLK_API vtlk_status_t vtlk_kv_arena_attach_tier(vtlk_kv_arena_t *arena,
+                                                 struct vtlk_tier_store *tier);
+
+/**
+ * @brief Demotes up to @p max_demote unpinned (refcount == 0) L1 blocks to L2/L3.
+ *
+ * Returns the number of demoted blocks in @p out_demoted (optional).
+ */
+VTLK_API vtlk_status_t vtlk_kv_arena_demote_lru(vtlk_kv_arena_t *arena,
+                                                uint32_t max_demote,
+                                                uint32_t *out_demoted);
 
 /* --------------------------------------------------------------------------
  * Block Allocator & Deduplication API

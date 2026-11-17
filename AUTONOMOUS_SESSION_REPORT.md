@@ -49,6 +49,13 @@ Vect-Link evolucionó de un transporte IPC SPSC lineal a un motor de almacenamie
   `15/15` tests aprobados en `0.552 s` (10 tests existentes de ring/IPC + 5 tests nuevos de CoW/dangling-view/LangGraph).
 - **`llama.cpp` Paged Bridge (`VTLK_BUILD_LLAMA_BRIDGE=ON`, target `llama_kv_paged_bridge`):**
   Compilación C11 limpia contra `llama.cpp` y ejecución de `--self-test` aprobada (`llama_kv_paged_bridge self-test PASSED (3 workers)`).
+- **Validación end-to-end con modelo GGUF real (`qwen2.5-0.5b-instruct-q4_k_m.gguf`, 247 tokens de system prompt → 47 bloques paginados = 3,038,708 B → 3 ramas divergentes):**
+  - `[branch 0] suffix_toks=17 | token_match=16/16 | max_logit_diff=0.000000`
+  - `[branch 1] suffix_toks=13 | token_match=16/16 | max_logit_diff=0.000000`
+  - `[branch 2] suffix_toks=12 | token_match=16/16 | max_logit_diff=0.000000`
+- **Acople Arena ↔ Tiering L1/L2/L3 y Hot-Path LRU:**
+  - `vtlk_kv_arena_attach_tier()` / `vtlk_kv_arena_demote_lru()` integrados; `vtlk_kv_block_retain()` / `vtlk_kv_restore()` promueven transparentemente bloques desalojados a L2/L3 de vuelta a L1 con verificación CRC32C (`test_arena_tier_transparent_restore` aprobado bajo Release y ASan+UBSan).
+  - Eliminado el cache-line bouncing en `vtlk_kv_block_retain()`: `lru_stamp` solo se actualiza al transicionar `refcount` de `1 -> 0` en `vtlk_kv_block_release()`.
 
 *(Nota de plataforma: la ejecución real de tests en esta sesión ocurrió en Windows x64; las rutas POSIX `shm_posix.c`, `os_notify_posix.c` y ramas POSIX de `kv_tier.c` fueron compiladas/revisadas pero no ejecutadas en un kernel Linux en esta sesión.)*
 
