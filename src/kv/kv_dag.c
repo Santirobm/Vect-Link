@@ -25,7 +25,6 @@
 #include <io.h>
 #else
 #include <fcntl.h>
-#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -194,10 +193,16 @@ static vtlk_status_t vtlk_dag_lock_acquire(const char *l3_dir,
 #else
     {
         int fd = open(lock_path, O_CREAT | O_RDWR, 0600);
+        struct flock fl;
         if (fd < 0) {
             return VTLK_ERR_IO;
         }
-        while (flock(fd, exclusive ? LOCK_EX : LOCK_SH) != 0) {
+        memset(&fl, 0, sizeof(fl));
+        fl.l_type = (short)(exclusive ? F_WRLCK : F_RDLCK);
+        fl.l_whence = SEEK_SET;
+        fl.l_start = 0;
+        fl.l_len = 0;
+        while (fcntl(fd, F_SETLKW, &fl) != 0) {
             if (errno == EINTR) {
                 continue;
             }
@@ -222,7 +227,13 @@ static void vtlk_dag_lock_release(vtlk_dag_file_lock_t *lock)
     }
 #else
     if (lock->fd >= 0) {
-        flock(lock->fd, LOCK_UN);
+        struct flock fl;
+        memset(&fl, 0, sizeof(fl));
+        fl.l_type = F_UNLCK;
+        fl.l_whence = SEEK_SET;
+        fl.l_start = 0;
+        fl.l_len = 0;
+        (void)fcntl(lock->fd, F_SETLK, &fl);
         close(lock->fd);
         lock->fd = -1;
     }
