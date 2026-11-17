@@ -19,6 +19,7 @@ set(VECTLINK_SOURCES
     src/kv/kv_arena.c
     src/kv/kv_cow.c
     src/kv/kv_tier.c
+    src/kv/kv_dag.c
     src/sync/desc_ring.c
 )
 
@@ -246,4 +247,27 @@ if(VTLK_BUILD_LLAMA_BRIDGE)
             target_compile_options(${llama_target} PRIVATE -Wall -Wextra -Werror)
         endif()
     endforeach()
+
+    add_executable(bench_llama_cow_apples benchmarks/bench_llama_cow_apples.c)
+    set_target_properties(bench_llama_cow_apples PROPERTIES
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS OFF
+    )
+    target_include_directories(bench_llama_cow_apples PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
+        ${VTLK_LLAMA_INCLUDES}
+    )
+    target_link_libraries(bench_llama_cow_apples PRIVATE vectlink "${LLAMA_LIBRARY}")
+    if(WIN32)
+        target_link_libraries(bench_llama_cow_apples PRIVATE psapi)
+    else()
+        target_link_libraries(bench_llama_cow_apples PRIVATE pthread m)
+    endif()
+    if(MSVC)
+        target_compile_options(bench_llama_cow_apples PRIVATE /O2 /W4 /WX)
+    else()
+        target_compile_options(bench_llama_cow_apples PRIVATE -O2 -Wall -Wextra -Werror)
+    endif()
 endif()

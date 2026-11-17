@@ -69,29 +69,42 @@ Vect-Link separates the **Data Plane** (paged CoW shared memory arena) from the 
 
 ## Benchmarks & Verification
 
-### 1. CoW Branching Latency (9.77 MiB / 10,000-Token Context)
+### 1. Apples-to-Apples vs. Native `llama.cpp` (N = 1, 2, 4, 8 Concurrent Agents)
 
-Measured via [benchmarks/bench_cow_git.c](benchmarks/bench_cow_git.c) and [benchmarks/bench_cow_git.py](benchmarks/bench_cow_git.py):
+Measured via [benchmarks/bench_llama_cow_apples.c](benchmarks/bench_llama_cow_apples.c) and [benchmarks/bench_cow_git.py](benchmarks/bench_cow_git.py) using **`qwen2.5-0.5b-instruct-q4_k_m.gguf`** (`242` shared system prompt tokens, ~15 divergent suffix tokens, `16` generated tokens per agent, `2` threads/agent, `2.84 MiB` KV state = `46` CoW pages × `64 KiB`):
 
-| Operation / Transport | Latency (p50) | Tensor Bytes Copied | Relative Speedup vs. Vect-Link |
-| :--- | :---: | :---: | :---: |
-| **Vect-Link C99 `restore`** | **0.50 µs** | **0 B** | Baseline (C99) |
-| **Vect-Link C99 `fork`** | **5.90 µs** | **0 B** | Baseline (C99) |
-| **Vect-Link C99 `snapshot_create`** | **6.30 µs** | **0 B** | Baseline (C99) |
-| **Vect-Link Python FFI CoW** | **0.015 ms** | **0 B** | **1.0×** |
-| Python `multiprocessing.shared_memory` | 0.517 ms | 9.77 MiB | 34.5× slower |
-| TCP Loopback Socket | 4.737 ms | 9.77 MiB | 315.8× slower |
-| SSD `mmap` + `os.fsync` | 42.550 ms | 9.77 MiB | 2,836.7× slower |
+| N | Method | Pure Fork / Load (µs) | TTFT Mean (ms) | TTFT Max (ms) | Total System RSS (MiB) |
+|---:|:---|---:|---:|---:|---:|
+| **1** | Cold Prefill (`N` procs, from scratch) | 0.00 | 1,362.44 | 1,362.44 | 474.70 |
+| **1** | `llama_state_seq_load_file` (`N` procs) | 3,399.90 | 209.72 | 209.72 | 457.46 |
+| **1** | **Vect-Link CoW (`N` procs, SHM Arena)** | **5.40** | **169.97** | **169.97** | **460.40** |
+| **1** | `llama_memory_seq_cp` (1 proc, no isolation) | 0.00 | 137.93 | 137.93 | 492.01 |
+| **2** | Cold Prefill (`N` procs, from scratch) | 0.00 | 1,557.08 | 1,562.83 | 949.26 |
+| **2** | `llama_state_seq_load_file` (`N` procs) | 3,997.20 | 205.01 | 206.25 | 914.79 |
+| **2** | **Vect-Link CoW (`N` procs, SHM Arena)** | **6.70** | **241.95** | **252.58** | **920.84** |
+| **2** | `llama_memory_seq_cp` (1 proc, no isolation) | 22.30 | 225.17 | 310.37 | 495.61 |
+| **4** | Cold Prefill (`N` procs, from scratch) | 0.00 | 3,342.85 | 3,497.25 | 1,898.45 |
+| **4** | `llama_state_seq_load_file` (`N` procs) | 5,389.97 | 369.48 | 405.50 | 1,830.14 |
+| **4** | **Vect-Link CoW (`N` procs, SHM Arena)** | **10.78** | **363.90** | **385.03** | **1,841.50** |
+| **4** | `llama_memory_seq_cp` (1 proc, no isolation) | 14.30 | 341.38 | 541.65 | 503.01 |
+| **8** | Cold Prefill (`N` procs, from scratch) | 0.00 | 4,626.76 | 4,826.23 | 3,796.82 |
+| **8** | `llama_state_seq_load_file` (`N` procs) | 9,132.17 | 478.79 | 539.66 | 3,660.21 |
+| **8** | **Vect-Link CoW (`N` procs, SHM Arena)** | **22.94** | **497.59** | **559.61** | **3,683.19** |
+| **8** | `llama_memory_seq_cp` (1 proc, no isolation) | 11.80 | 549.96 | 998.80 | 520.21 |
 
-### 2. End-to-End `llama.cpp` GGUF Validation
+* **State Fork Speedup:** `5.40–22.94 µs` vs `3,399.90–9,132.17 µs` for `llama_state_seq_load_file` (**~400–630× faster** state handoff).
+* **TTFT Speedup:** **~8–9.3× faster** than Cold Prefill across `N = 1..8`, and lower tail TTFT than single-process `llama_memory_seq_cp` at `N = 4` (`385.03 ms` vs `541.65 ms`) and `N = 8` (`559.61 ms` vs `998.80 ms`) via multi-process parallelism.
+* **RSS Note:** In multi-process runs (`N` independent OS processes), each worker process maps the GGUF model weights (~460 MiB/process), while the shared KV prefix (`2.84 MiB` in SHM) is stored once without per-worker duplication.
 
-Verified with [examples/llama_kv_paged_bridge.c](examples/llama_kv_paged_bridge.c) running **`qwen2.5-0.5b-instruct-q4_k_m.gguf`** with a shared 247-token system prompt (47 paged blocks = 3,038,708 bytes) forked into 3 independent agent branches (`Role A`, `Role B`, `Role C`) and compared against cold baseline runs from scratch:
+### 2. Zero-Copy `llama.cpp` GGUF Bit-Exact Validation
 
-| Branch | Divergent Suffix | Token Match vs. Cold Prefill | Max Logit Difference |
-| :--- | :---: | :---: | :---: |
-| **Branch 0 (Researcher)** | 17 tokens | **16 / 16 (100%)** | `0.000000` |
-| **Branch 1 (Critic)** | 13 tokens | **16 / 16 (100%)** | `0.000000` |
-| **Branch 2 (Architect)** | 12 tokens | **16 / 16 (100%)** | `0.000000` |
+Verified with [examples/llama_kv_paged_bridge.c](examples/llama_kv_paged_bridge.c) running **`qwen2.5-0.5b-instruct-q4_k_m.gguf`** (`113`-token shared prompt, `22` contiguous paged blocks = `1,390,508` bytes, `restore_heap_allocs=0`, `copied_bytes=0`):
+
+| Branch | Divergent Suffix | Token Match vs. Cold Prefill | Max Logit Difference | Mapped Zero-Copy |
+| :--- | :---: | :---: | :---: | :---: |
+| **Branch 0 (Researcher)** | 17 tokens | **16 / 16 (100%)** | `0.000000` | `1,390,508 B` (`0` heap allocs) |
+| **Branch 1 (Critic)** | 13 tokens | **16 / 16 (100%)** | `0.000000` | `1,390,508 B` (`0` heap allocs) |
+| **Branch 2 (Architect)** | 12 tokens | **16 / 16 (100%)** | `0.000000` | `1,390,508 B` (`0` heap allocs) |
 
 ---
 
