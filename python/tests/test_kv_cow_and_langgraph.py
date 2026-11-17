@@ -4,7 +4,12 @@ import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+PYTHON_ROOT = Path(__file__).resolve().parents[1]
+try:
+    import vectlink  # noqa: F401
+except ImportError:
+    if str(PYTHON_ROOT) not in sys.path:
+        sys.path.insert(0, str(PYTHON_ROOT))
 
 from vectlink import (  # noqa: E402
     Branch,
