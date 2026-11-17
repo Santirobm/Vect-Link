@@ -18,8 +18,7 @@
 #ifdef __linux__
 #include <linux/futex.h>
 #include <sys/syscall.h>
-#endif
-
+#else
 static uint64_t vtlk_posix_monotonic_ms(void)
 {
     struct timespec ts;
@@ -28,6 +27,7 @@ static uint64_t vtlk_posix_monotonic_ms(void)
     }
     return ((uint64_t)ts.tv_sec * 1000u) + ((uint64_t)ts.tv_nsec / 1000000u);
 }
+#endif
 
 vtlk_status_t vtlk_notify_wait_u32(volatile uint32_t *addr,
                                    uint32_t expected,

@@ -46,7 +46,7 @@ def _make_identity(
 
 class TestKvCowAndLangGraph(unittest.TestCase):
     def setUp(self) -> None:
-        self.shm_name = f"/vtlk_kv_py_test_{os.getpid()}_{id(self)}"
+        self.shm_name = f"/vtlk_kv_{os.getpid()}_{id(self) & 0xFFFF:x}"
 
     def test_hash_tokens_prefix_property_and_arena_stats(self) -> None:
         tokens_a = [101, 202, 303, 404]

@@ -197,7 +197,7 @@ static int reassemble_state_from_ptrs(const void *const *ptrs,
 static int run_self_test(uint32_t num_workers)
 {
     char shm_name[128];
-    snprintf(shm_name, sizeof(shm_name), "/vtlk_llama_paged_test_%d", VTLK_GETPID());
+    snprintf(shm_name, sizeof(shm_name), "/vtlk_lpb_t_%d", VTLK_GETPID());
 
     vtlk_kv_arena_t arena;
     vtlk_status_t st = vtlk_kv_arena_create(&arena, shm_name, 64u, 4096u);
@@ -454,7 +454,7 @@ static int run_llama_model_mode(const char *model_path,
     }
 
     char shm_name[128];
-    snprintf(shm_name, sizeof(shm_name), "/vtlk_llama_paged_%d", VTLK_GETPID());
+    snprintf(shm_name, sizeof(shm_name), "/vtlk_lpb_%d", VTLK_GETPID());
 
     vtlk_kv_arena_t arena;
     if (vtlk_kv_arena_create(&arena, shm_name, BRIDGE_ARENA_BLOCKS, BRIDGE_PAGE_BYTES) != VTLK_OK) {
