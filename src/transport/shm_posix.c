@@ -113,7 +113,9 @@ vtlk_status_t vtlk_shm_open(vtlk_shm_t *shm, const char *name, size_t size)
 
     {
         struct stat st_buf;
-        if (fstat(fd, &st_buf) != 0 || st_buf.st_size < (off_t)size) {
+        if (fstat(fd, &st_buf) != 0 ||
+            st_buf.st_uid != getuid() ||
+            st_buf.st_size < (off_t)size) {
             close(fd);
             return VTLK_ERR_SHM;
         }

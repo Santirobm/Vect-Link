@@ -15,6 +15,11 @@ set(VECTLINK_SOURCES
     src/codec/fp16.c
     src/codec/int4.c
     src/codec/codec.c
+    src/kv/kv_hash.c
+    src/kv/kv_arena.c
+    src/kv/kv_cow.c
+    src/kv/kv_tier.c
+    src/sync/desc_ring.c
 )
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|amd64|x86_64|X86_64|i686|x86")
@@ -32,9 +37,15 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|amd64|x86_64|X86_64|i686|x86")
 endif()
 
 if(WIN32)
-    list(APPEND VECTLINK_SOURCES src/transport/shm_windows.c)
+    list(APPEND VECTLINK_SOURCES
+        src/transport/shm_windows.c
+        src/sync/os_notify_windows.c
+    )
 else()
-    list(APPEND VECTLINK_SOURCES src/transport/shm_posix.c)
+    list(APPEND VECTLINK_SOURCES
+        src/transport/shm_posix.c
+        src/sync/os_notify_posix.c
+    )
 endif()
 
 add_library(vectlink STATIC ${VECTLINK_SOURCES})
@@ -47,7 +58,9 @@ target_include_directories(vectlink
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-if(UNIX AND NOT APPLE)
+if(WIN32)
+    target_link_libraries(vectlink PUBLIC advapi32)
+elseif(UNIX AND NOT APPLE)
     find_package(Threads REQUIRED)
     target_link_libraries(vectlink PUBLIC rt m Threads::Threads)
 elseif(UNIX)
@@ -77,7 +90,9 @@ target_include_directories(vectlink_shared
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-if(UNIX AND NOT APPLE)
+if(WIN32)
+    target_link_libraries(vectlink_shared PUBLIC advapi32)
+elseif(UNIX AND NOT APPLE)
     target_link_libraries(vectlink_shared PUBLIC rt m Threads::Threads)
 elseif(UNIX)
     target_link_libraries(vectlink_shared PUBLIC Threads::Threads)
