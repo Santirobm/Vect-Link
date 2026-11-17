@@ -17,7 +17,7 @@ When multiple agents share a long system prompt—or when a reasoning pipeline b
 
 Vect-Link separates the **Data Plane** (paged CoW shared memory arena) from the **Control Plane** (compact descriptor rings and native OS notifications):
 
-* **Zero-Copy Branching (`Fork` in ~5.9 µs):** Forking a context duplicates only a lightweight table of block IDs (`block_ids[]`) and increments atomic reference counts (`refcount`). Tensor data is never copied.
+* **Zero-Copy Branching (`Fork` in ~4.9–5.9 µs):** Forking a context duplicates only a lightweight table of block IDs (`block_ids[]`) and increments atomic reference counts (`refcount`). Vect-Link never copies tensor data across processes or in intermediate buffers up to the inference API boundary.
 * **Bit-Exact RoPE Preservation:** Because all forked branches continue from exact token position $pos = N$, Rotary Position Embeddings (RoPE) remain 100% valid with **zero perplexity or logit degradation** (`max_logit_diff = 0.000000` verified against cold prefill).
 * **Strict Block Identity Contract:** Blocks are content-addressed and validated against the full model compatibility tuple—preventing silent corruption across mismatched models, RoPE configurations, quantization formats, or LoRA adapters.
 * **Zero External C Dependencies:** Pure C99 core with deterministic memory management, AVX2/SSE4.2 acceleration, and native cross-platform OS primitives (Linux, macOS & Windows).
@@ -106,6 +106,8 @@ Measured via [benchmarks/bench_llama_cow_apples.c](benchmarks/bench_llama_cow_ap
 ### 2. Zero-Copy `llama.cpp` GGUF Bit-Exact Validation
 
 Verified with [examples/llama_kv_paged_bridge.c](examples/llama_kv_paged_bridge.c) running **`qwen2.5-0.5b-instruct-q4_k_m.gguf`** (`113`-token shared prompt, `22` contiguous paged blocks = `1,390,508` bytes, `restore_heap_allocs=0`, `copied_bytes=0`):
+
+> **Zero-Copy Scope:** Vect-Link performs zero copies across processes and up to the `llama.cpp` API boundary (`0` heap allocations and `0` intermediate buffers when passing the direct SHM pointer to `llama_state_seq_set_data()`). Internally, `llama.cpp` ingests and copies that restored state into the private KV tensors of each worker's `llama_context`.
 
 | Branch | Divergent Suffix | Token Match vs. Cold Prefill | Max Logit Difference | Mapped Zero-Copy |
 | :--- | :---: | :---: | :---: | :---: |

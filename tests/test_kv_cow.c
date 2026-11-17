@@ -697,10 +697,261 @@ static void test_arena_tier_transparent_restore(void)
     remove(l2_path);
 }
 
+typedef struct cold_dag_payload {
+    uint32_t block_count;
+    uint32_t block_ids[16];
+    vtlk_kv_identity_t identities[16];
+} cold_dag_payload_t;
+
+static int run_cold_producer(const char *shm_name, const char *l3_dir)
+{
+    char l2_path[512];
+    uint8_t l1_mem[2u * 4096u];
+    vtlk_kv_arena_t arena;
+    vtlk_tier_store_t tier;
+    vtlk_tier_config_t cfg;
+    vtlk_kv_dag_t dag;
+    vtlk_kv_branch_t branch;
+    cold_dag_payload_t payload;
+    vtlk_kv_checkpoint_meta_t meta;
+    uint64_t prefix_hash = 0u;
+    uint64_t snap_id = 0u;
+    uint32_t demoted = 0u;
+    uint32_t i;
+
+    snprintf(l2_path, sizeof(l2_path), "vtlk_cold_l2.bin");
+    remove(l2_path);
+    (void)vtlk_shm_unlink(shm_name);
+
+    assert(vtlk_kv_arena_create(&arena, shm_name, 32u, 4096u) == VTLK_OK);
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.block_size = 4096u;
+    cfg.l1_capacity = 2u;
+    cfg.l2_capacity = 0u;
+    cfg.max_blocks = 32u;
+    cfg.high_watermark = 2u;
+    cfg.l1_mem = l1_mem;
+    cfg.l2_path = NULL;
+    cfg.l3_dir = l3_dir;
+    assert(vtlk_tier_init(&tier, &cfg) == VTLK_OK);
+    assert(vtlk_kv_arena_attach_tier(&arena, &tier) == VTLK_OK);
+    assert(vtlk_kv_dag_open(&dag, l3_dir) == VTLK_OK);
+
+    memset(&branch, 0, sizeof(branch));
+    memset(&payload, 0, sizeof(payload));
+    payload.block_count = 16u;
+
+    for (i = 0u; i < 16u; ++i) {
+        uint32_t bid = 0u;
+        uint32_t tok = 5000u + i;
+        uint8_t *bdata;
+        vtlk_kv_identity_t id;
+
+        prefix_hash = vtlk_kv_hash_tokens(prefix_hash, &tok, 1u);
+        id = make_base_identity(prefix_hash, i * 16u, 16u);
+        if (i == 0u) {
+            branch.model_arch_hash = id.model_arch_hash;
+            branch.rope_config_hash = id.rope_config_hash;
+            branch.lora_adapter_hash = id.lora_adapter_hash;
+            branch.kv_dtype = id.kv_dtype;
+            branch.layer_count = id.layer_count;
+            branch.head_dim = id.head_dim;
+            branch.kv_head_count = id.kv_head_count;
+        }
+
+        assert(vtlk_kv_block_alloc(&arena, &bid) == VTLK_OK);
+        bdata = (uint8_t *)vtlk_kv_block_data(&arena, bid);
+        fill_kv_pattern(bdata, 4096u, 77u, i);
+        assert(vtlk_kv_block_seal(&arena, bid, &id) == VTLK_OK);
+        assert(vtlk_kv_branch_append_block(&arena, &branch, bid) == VTLK_OK);
+        assert(vtlk_kv_block_release(&arena, bid) == VTLK_OK);
+
+        payload.block_ids[i] = bid;
+        payload.identities[i] = id;
+    }
+
+    assert(vtlk_kv_snapshot_create(&arena, &branch, &snap_id) == VTLK_OK);
+
+    memset(&meta, 0, sizeof(meta));
+    snprintf(meta.branch_name, sizeof(meta.branch_name), "cold-main");
+    snprintf(meta.thread_id, sizeof(meta.thread_id), "cold-thread");
+    snprintf(meta.checkpoint_id, sizeof(meta.checkpoint_id), "ckpt-cold-1");
+    meta.snapshot_id = snap_id;
+    meta.created_seq = 1u;
+    meta.flags = VTLK_KV_DAG_FLAG_CHECKPOINT | VTLK_KV_DAG_FLAG_BRANCH;
+    assert(vtlk_kv_dag_put(&dag, &meta, &payload, sizeof(payload)) == VTLK_OK);
+
+    /* Release branch + snapshot pins so all 16 blocks have refcount == 0 */
+    assert(vtlk_kv_branch_release(&arena, &branch) == VTLK_OK);
+    for (i = 0u; i < 16u; ++i) {
+        assert(vtlk_kv_block_release(&arena, payload.block_ids[i]) == VTLK_OK);
+    }
+
+    /* Spill all 16 blocks through L1 -> L2 -> L3 SSD and flush index */
+    assert(vtlk_kv_arena_demote_lru(&arena, 16u, &demoted) == VTLK_OK);
+    assert(demoted == 16u);
+    assert(vtlk_tier_evict_l1(&tier, 16u) == VTLK_OK);
+    assert(vtlk_tier_flush_index(&tier) == VTLK_OK);
+
+    vtlk_kv_dag_close(&dag);
+    vtlk_tier_close(&tier);
+    vtlk_kv_arena_close(&arena);
+    (void)vtlk_shm_unlink(shm_name);
+    remove(l2_path);
+    return 0;
+}
+
+static int run_cold_consumer(const char *shm_name2, const char *l3_dir)
+{
+    char l2_path[512];
+    uint8_t l1_mem[2u * 4096u];
+    vtlk_kv_arena_t arena;
+    vtlk_tier_store_t tier;
+    vtlk_tier_config_t cfg;
+    vtlk_kv_dag_t dag;
+    vtlk_kv_checkpoint_meta_t meta;
+    cold_dag_payload_t payload;
+    uint64_t out_len = 0u;
+    uint32_t i;
+
+    snprintf(l2_path, sizeof(l2_path), "vtlk_cold_l2_c.bin");
+    remove(l2_path);
+    (void)vtlk_shm_unlink(shm_name2);
+
+    assert(vtlk_kv_arena_create(&arena, shm_name2, 32u, 4096u) == VTLK_OK);
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.block_size = 4096u;
+    cfg.l1_capacity = 2u;
+    cfg.l2_capacity = 0u;
+    cfg.max_blocks = 32u;
+    cfg.high_watermark = 2u;
+    cfg.l1_mem = l1_mem;
+    cfg.l2_path = NULL;
+    cfg.l3_dir = l3_dir;
+    assert(vtlk_tier_init(&tier, &cfg) == VTLK_OK);
+    assert(vtlk_kv_dag_open(&dag, l3_dir) == VTLK_OK);
+
+    memset(&meta, 0, sizeof(meta));
+    memset(&payload, 0, sizeof(payload));
+    assert(vtlk_kv_dag_get(&dag, "cold-thread", "ckpt-cold-1",
+                           &meta, &payload, sizeof(payload), &out_len) == VTLK_OK);
+    assert(out_len == sizeof(payload));
+    assert(payload.block_count == 16u);
+
+    for (i = 0u; i < 16u; ++i) {
+        const void *promoted = NULL;
+        uint32_t new_bid = 0u;
+        uint32_t looked_up = 0u;
+        void *dst;
+
+        assert(vtlk_tier_acquire(&tier, payload.block_ids[i], &promoted) == VTLK_OK);
+        assert(verify_kv_pattern((const uint8_t *)promoted, 4096u, 77u, i));
+
+        assert(vtlk_kv_block_alloc(&arena, &new_bid) == VTLK_OK);
+        dst = vtlk_kv_block_data(&arena, new_bid);
+        memcpy(dst, promoted, 4096u);
+        assert(vtlk_kv_block_seal(&arena, new_bid, &payload.identities[i]) == VTLK_OK);
+        assert(vtlk_kv_block_lookup(&arena, &payload.identities[i], &looked_up) == VTLK_OK);
+        assert(looked_up == new_bid);
+        assert(verify_kv_pattern((const uint8_t *)vtlk_kv_block_data(&arena, looked_up),
+                                 4096u, 77u, i));
+
+        assert(vtlk_kv_block_release(&arena, looked_up) == VTLK_OK);
+        assert(vtlk_kv_block_release(&arena, new_bid) == VTLK_OK);
+        assert(vtlk_tier_release(&tier, payload.block_ids[i]) == VTLK_OK);
+    }
+
+    vtlk_kv_dag_close(&dag);
+    vtlk_tier_close(&tier);
+    vtlk_kv_arena_close(&arena);
+    (void)vtlk_shm_unlink(shm_name2);
+    remove(l2_path);
+    return 0;
+}
+
+static int run_cold_child(const char *exe_path,
+                          const char *flag,
+                          const char *shm_name,
+                          const char *l3_dir)
+{
+#ifdef _WIN32
+    char cmd_line[1024];
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    DWORD exit_code = 1u;
+
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    snprintf(cmd_line, sizeof(cmd_line), "\"%s\" %s %s %s",
+             exe_path, flag, shm_name, l3_dir);
+    if (!CreateProcessA(NULL, cmd_line, NULL, NULL, FALSE, 0u, NULL, NULL, &si, &pi)) {
+        return 1;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return (exit_code == 0u) ? 0 : 1;
+#else
+    pid_t pid = fork();
+    int status = 0;
+    if (pid < 0) {
+        return 1;
+    }
+    if (pid == 0) {
+        execl(exe_path, exe_path, flag, shm_name, l3_dir, (char *)NULL);
+        _exit(127);
+    }
+    if (waitpid(pid, &status, 0) < 0) {
+        return 1;
+    }
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : 1;
+#endif
+}
+
+static void test_cold_restart_full_kv_recovery(const char *exe_path)
+{
+    char shm1[64];
+    char shm2[64];
+    const char *l3_dir = "vtlk_cold_recovery_l3";
+    vtlk_kv_arena_t probe;
+#ifdef _WIN32
+    unsigned long pid = (unsigned long)GetCurrentProcessId();
+#else
+    unsigned long pid = (unsigned long)getpid();
+#endif
+
+    snprintf(shm1, sizeof(shm1), "/vtlk_cold_p_%lu", pid);
+    snprintf(shm2, sizeof(shm2), "/vtlk_cold_c_%lu", pid);
+    (void)vtlk_shm_unlink(shm1);
+    (void)vtlk_shm_unlink(shm2);
+
+    /* 1. Producer process creates SHM + L3, writes & spills 16 blocks, destroys SHM */
+    assert(run_cold_child(exe_path, "--cold-producer", shm1, l3_dir) == 0);
+
+    /* 2. Intermediate verification: SHM segment no longer exists in the OS */
+    memset(&probe, 0, sizeof(probe));
+    assert(vtlk_kv_arena_open(&probe, shm1) != VTLK_OK);
+
+    /* 3. Fresh consumer process creates new SHM, recovers DAG & promotes L3 -> L1 */
+    assert(run_cold_child(exe_path, "--cold-consumer", shm2, l3_dir) == 0);
+
+    printf("Cold restart full KV recovery test passed (L3 SSD -> fresh SHM, 16 blocks).\n");
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 5 && strcmp(argv[1], "--worker") == 0) {
         return run_worker(argv[2], argv[3], argv[4]);
+    }
+    if (argc == 4 && strcmp(argv[1], "--cold-producer") == 0) {
+        return run_cold_producer(argv[2], argv[3]);
+    }
+    if (argc == 4 && strcmp(argv[1], "--cold-consumer") == 0) {
+        return run_cold_consumer(argv[2], argv[3]);
     }
 
     test_kv_hash_chaining();
@@ -711,5 +962,9 @@ int main(int argc, char **argv)
     test_arena_tier_transparent_restore();
     printf("All KV/Sync/Tier unit tests passed.\n");
 
-    return run_multiproc_cow_stress(argv[0]);
+    if (run_multiproc_cow_stress(argv[0]) != 0) {
+        return 1;
+    }
+    test_cold_restart_full_kv_recovery(argv[0]);
+    return 0;
 }
