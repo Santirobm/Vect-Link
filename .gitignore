@@ -26,6 +26,8 @@ ref_embd.bin
 .DS_Store
 
 # Python
+.venv/
+.venv-test/
 __pycache__/
 *.pyc
 *.egg-info/

@@ -55,6 +55,15 @@ VTLK_ERR_FULL = -8
 VTLK_ERR_EMPTY = -9
 VTLK_ERR_SHM = -10
 VTLK_ERR_BUSY = -11
+VTLK_ERR_TIMEOUT = -12
+VTLK_ERR_IO = -13
+VTLK_ERR_NOT_FOUND = -14
+
+VTLK_KV_DAG_STR_MAX = 128
+VTLK_KV_DAG_PATH_MAX = 512
+VTLK_KV_DAG_FLAG_CHECKPOINT = 0
+VTLK_KV_DAG_FLAG_WRITES = 1 << 0
+VTLK_KV_DAG_FLAG_BRANCH = 1 << 1
 
 
 class VectLinkError(Exception):
@@ -93,6 +102,18 @@ class RingBusyError(VectLinkError):
     pass
 
 
+class IoError(VectLinkError):
+    pass
+
+
+class NotFoundError(VectLinkError):
+    pass
+
+
+class VtlkTimeoutError(VectLinkError):
+    pass
+
+
 _ERROR_MAP = {
     VTLK_ERR_BUFFER_TOO_SMALL: (BufferTooSmallError, "Buffer too small"),
     VTLK_ERR_CRC_MISMATCH: (CrcMismatchError, "CRC32C checksum mismatch"),
@@ -101,6 +122,9 @@ _ERROR_MAP = {
     VTLK_ERR_EMPTY: (RingEmptyError, "Ring buffer is empty"),
     VTLK_ERR_SHM: (ShmError, "Shared memory operation failed"),
     VTLK_ERR_BUSY: (RingBusyError, "Ring slot is already in flight (busy)"),
+    VTLK_ERR_TIMEOUT: (VtlkTimeoutError, "Operation timed out"),
+    VTLK_ERR_IO: (IoError, "I/O operation failed"),
+    VTLK_ERR_NOT_FOUND: (NotFoundError, "Entry not found"),
 }
 
 
@@ -274,6 +298,32 @@ class VtlkKvArenaStats(ctypes.Structure):
         ("cache_hits", ctypes.c_uint64),
         ("cache_misses", ctypes.c_uint64),
         ("evictions", ctypes.c_uint64),
+    ]
+
+
+class VtlkKvCheckpointMeta(ctypes.Structure):
+    _fields_ = [
+        ("branch_name", ctypes.c_char * VTLK_KV_DAG_STR_MAX),
+        ("thread_id", ctypes.c_char * VTLK_KV_DAG_STR_MAX),
+        ("checkpoint_id", ctypes.c_char * VTLK_KV_DAG_STR_MAX),
+        ("parent_checkpoint_id", ctypes.c_char * VTLK_KV_DAG_STR_MAX),
+        ("snapshot_id", ctypes.c_uint64),
+        ("created_seq", ctypes.c_uint64),
+        ("payload_bytes", ctypes.c_uint64),
+        ("payload_crc32c", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+class VtlkKvDag(ctypes.Structure):
+    _fields_ = [
+        ("l3_dir", ctypes.c_char * VTLK_KV_DAG_PATH_MAX),
+        ("next_seq", ctypes.c_uint64),
+        ("count", ctypes.c_uint32),
+        ("capacity", ctypes.c_uint32),
+        ("entries", ctypes.POINTER(VtlkKvCheckpointMeta)),
+        ("is_open", ctypes.c_int),
+        ("reserved0", ctypes.c_int),
     ]
 
 
@@ -617,6 +667,44 @@ def _bind_library(path: str) -> ctypes.CDLL:
         ctypes.POINTER(VtlkKvBranch),
     ]
     lib.vtlk_kv_branch_release.restype = ctypes.c_int
+
+    # Persistent L3 DAG Index API
+    lib.vtlk_kv_dag_open.argtypes = [
+        ctypes.POINTER(VtlkKvDag),
+        ctypes.c_char_p,
+    ]
+    lib.vtlk_kv_dag_open.restype = ctypes.c_int
+
+    lib.vtlk_kv_dag_close.argtypes = [ctypes.POINTER(VtlkKvDag)]
+    lib.vtlk_kv_dag_close.restype = None
+
+    lib.vtlk_kv_dag_put.argtypes = [
+        ctypes.POINTER(VtlkKvDag),
+        ctypes.POINTER(VtlkKvCheckpointMeta),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    lib.vtlk_kv_dag_put.restype = ctypes.c_int
+
+    lib.vtlk_kv_dag_get.argtypes = [
+        ctypes.POINTER(VtlkKvDag),
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(VtlkKvCheckpointMeta),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.vtlk_kv_dag_get.restype = ctypes.c_int
+
+    lib.vtlk_kv_dag_list.argtypes = [
+        ctypes.POINTER(VtlkKvDag),
+        ctypes.c_char_p,
+        ctypes.POINTER(VtlkKvCheckpointMeta),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    lib.vtlk_kv_dag_list.restype = ctypes.c_int
 
     return lib
 

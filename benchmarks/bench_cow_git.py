@@ -11,6 +11,7 @@ import mmap
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -318,6 +319,46 @@ def format_row(name: str, samples: List[int], copied_bytes: int) -> str:
     return f"| {name:<42} | {p50_ms:8.3f} | {p99_ms:8.3f} | {ops_per_s:9.1f} ops/s ({eff_gb_s:6.2f} GiB/s eff) | {copied_str:<17} |"
 
 
+def run_apples_to_apples_bench() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    exe_name = "bench_llama_cow_apples.exe" if sys.platform == "win32" else "bench_llama_cow_apples"
+    candidates = []
+    env_bin = os.environ.get("VECTLINK_APPLES_BENCH")
+    if env_bin:
+        candidates.append(Path(env_bin))
+    candidates.extend([
+        repo_root / "build" / exe_name,
+        repo_root / exe_name,
+    ])
+
+    target = next((p for p in candidates if p.exists()), None)
+    if target is None:
+        return
+
+    env = os.environ.copy()
+    if sys.platform == "win32":
+        extra_paths = [
+            r"C:\msys64\clang64\bin",
+            r"C:\Users\sgi.lm\Desktop\llama.cpp\build\bin",
+        ]
+        existing = [p for p in extra_paths if os.path.isdir(p)]
+        if existing:
+            env["PATH"] = os.pathsep.join(existing) + os.pathsep + env.get("PATH", "")
+
+    print()
+    proc = subprocess.run(
+        [str(target)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    if proc.returncode != 0 and proc.stderr:
+        print(proc.stderr.rstrip(), file=sys.stderr)
+
+
 def main() -> None:
     lib = load_vectlink_lib()
     src_data = bytes([0x5A]) * KV_BYTES
@@ -334,6 +375,8 @@ def main() -> None:
     print(format_row("multiprocessing.shared_memory (Full Copy)", s_shm, KV_BYTES))
     print(format_row("Local TCP Loopback Socket (127.0.0.1)", s_tcp, KV_BYTES))
     print(format_row("SSD File (write + os.fsync + mmap read)", s_ssd, KV_BYTES))
+
+    run_apples_to_apples_bench()
 
 
 if __name__ == "__main__":

@@ -388,6 +388,89 @@ VTLK_API vtlk_status_t vtlk_kv_branch_append_block(vtlk_kv_arena_t *arena,
 VTLK_API vtlk_status_t vtlk_kv_branch_release(vtlk_kv_arena_t *arena,
                                               vtlk_kv_branch_t *branch);
 
+/* --------------------------------------------------------------------------
+ * Persistent L3 SSD + SHM DAG / Checkpoint Metadata Index API
+ * -------------------------------------------------------------------------- */
+
+#define VTLK_KV_DAG_STR_MAX   128u
+#define VTLK_KV_DAG_PATH_MAX  512u
+#define VTLK_KV_DAG_MAGIC     0x44414731u /* "DAG1" */
+#define VTLK_KV_DAG_VERSION   1u
+
+typedef enum vtlk_kv_dag_flags {
+    VTLK_KV_DAG_FLAG_CHECKPOINT = 0u,
+    VTLK_KV_DAG_FLAG_WRITES     = (1u << 0),
+    VTLK_KV_DAG_FLAG_BRANCH     = (1u << 1)
+} vtlk_kv_dag_flags_t;
+
+typedef struct vtlk_kv_checkpoint_meta {
+    char branch_name[VTLK_KV_DAG_STR_MAX];
+    char thread_id[VTLK_KV_DAG_STR_MAX];
+    char checkpoint_id[VTLK_KV_DAG_STR_MAX];
+    char parent_checkpoint_id[VTLK_KV_DAG_STR_MAX];
+    uint64_t snapshot_id;
+    uint64_t created_seq;
+    uint64_t payload_bytes;
+    uint32_t payload_crc32c;
+    uint32_t flags;
+} vtlk_kv_checkpoint_meta_t;
+
+typedef struct vtlk_kv_dag {
+    char l3_dir[VTLK_KV_DAG_PATH_MAX];
+    uint64_t next_seq;
+    uint32_t count;
+    uint32_t capacity;
+    vtlk_kv_checkpoint_meta_t *entries;
+    int is_open;
+    int reserved0;
+} vtlk_kv_dag_t;
+
+/**
+ * @brief Opens or initializes a persistent DAG index in @p l3_dir.
+ */
+VTLK_API vtlk_status_t vtlk_kv_dag_open(vtlk_kv_dag_t *dag,
+                                        const char *l3_dir);
+
+/**
+ * @brief Closes a DAG index handle and frees its in-memory entry table.
+ */
+VTLK_API void vtlk_kv_dag_close(vtlk_kv_dag_t *dag);
+
+/**
+ * @brief Atomically persists a checkpoint metadata entry and payload blob.
+ */
+VTLK_API vtlk_status_t vtlk_kv_dag_put(vtlk_kv_dag_t *dag,
+                                       const vtlk_kv_checkpoint_meta_t *meta,
+                                       const void *payload,
+                                       size_t payload_len);
+
+/**
+ * @brief Retrieves a checkpoint's metadata and payload blob (verifying CRC32C).
+ *
+ * If @p checkpoint_id is NULL or empty, retrieves the latest checkpoint for
+ * @p thread_id. If @p out_buf is NULL or @p buf_cap is smaller than the
+ * payload, sets @p out_len (and @p out_meta if non-NULL) and returns
+ * VTLK_ERR_BUFFER_TOO_SMALL.
+ */
+VTLK_API vtlk_status_t vtlk_kv_dag_get(vtlk_kv_dag_t *dag,
+                                       const char *thread_id,
+                                       const char *checkpoint_id,
+                                       vtlk_kv_checkpoint_meta_t *out_meta,
+                                       void *out_buf,
+                                       size_t buf_cap,
+                                       size_t *out_len);
+
+/**
+ * @brief Lists checkpoint metadata entries (newest first).
+ *
+ * If @p thread_id is NULL or empty, lists across all threads.
+ */
+VTLK_API vtlk_status_t vtlk_kv_dag_list(vtlk_kv_dag_t *dag,
+                                       const char *thread_id,
+                                       vtlk_kv_checkpoint_meta_t *out_metas,
+                                       uint32_t max_metas,
+                                       uint32_t *out_count);
+
 #ifdef __cplusplus
 }
 #endif
