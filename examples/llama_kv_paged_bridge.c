@@ -45,12 +45,11 @@ typedef struct bridge_rope_config {
     int32_t n_head_kv;
 } bridge_rope_config_t;
 
-typedef struct bridge_page_header {
-    uint32_t total_state_bytes;
-    uint32_t page_index;
-    uint32_t page_payload_bytes;
-    uint32_t pos_n;
-} bridge_page_header_t;
+typedef struct bridge_restore_metrics {
+    size_t mapped_zero_copy_bytes;
+    size_t copied_bytes;
+    uint32_t restore_heap_allocs;
+} bridge_restore_metrics_t;
 
 static void print_usage(const char *prog)
 {
@@ -86,7 +85,7 @@ static int partition_state_into_branch(vtlk_kv_arena_t *arena,
                                        uint32_t pos_n,
                                        const vtlk_kv_identity_t *base_id)
 {
-    const size_t max_payload = (size_t)arena->block_size_bytes - sizeof(bridge_page_header_t);
+    const size_t max_payload = (size_t)arena->block_size_bytes;
     size_t offset = 0;
     uint32_t page_idx = 0;
     uint64_t rolling_hash = base_id->token_prefix_hash;
@@ -109,19 +108,19 @@ static int partition_state_into_branch(vtlk_kv_arena_t *arena,
         }
 
         uint8_t *dst = (uint8_t *)vtlk_kv_block_data(arena, block_id);
-        if (dst == NULL) {
+        vtlk_kv_block_header_t *hdr = vtlk_kv_block_header(arena, block_id);
+        if (dst == NULL || hdr == NULL) {
             vtlk_kv_block_release(arena, block_id);
             return -1;
         }
 
-        bridge_page_header_t phdr;
-        phdr.total_state_bytes = (uint32_t)state_bytes;
-        phdr.page_index = page_idx;
-        phdr.page_payload_bytes = (uint32_t)chunk;
-        phdr.pos_n = pos_n;
-
-        memcpy(dst, &phdr, sizeof(phdr));
-        memcpy(dst + sizeof(phdr), state_buf + offset, chunk);
+        /* Store raw KV payload contiguously without interleaved headers;
+         * page payload byte count lives out-of-band in hdr->reserved_imm. */
+        memcpy(dst, state_buf + offset, chunk);
+        if (chunk < max_payload) {
+            memset(dst + chunk, 0, max_payload - chunk);
+        }
+        hdr->reserved_imm = (uint32_t)chunk;
 
         /* Chain page hash so every paged block has a distinct content-addressed identity */
         uint32_t page_tag = page_idx + 1u;
@@ -153,44 +152,68 @@ static int partition_state_into_branch(vtlk_kv_arena_t *arena,
     return 0;
 }
 
-static int reassemble_state_from_ptrs(const void *const *ptrs,
-                                      uint32_t block_count,
-                                      uint32_t prefix_blocks,
-                                      uint8_t **out_buf,
-                                      size_t *out_bytes,
-                                      uint32_t *out_pos_n)
+static int prepare_restore_view(vtlk_kv_arena_t *arena,
+                                const vtlk_kv_branch_t *branch,
+                                const void *const *ptrs,
+                                uint8_t *prealloc_buf,
+                                size_t prealloc_cap,
+                                const uint8_t **out_ptr,
+                                size_t *out_bytes,
+                                uint32_t *out_pos_n,
+                                bridge_restore_metrics_t *metrics)
 {
-    if (prefix_blocks == 0 || prefix_blocks > block_count) {
+    if (arena == NULL || branch == NULL || ptrs == NULL ||
+        out_ptr == NULL || out_bytes == NULL || out_pos_n == NULL ||
+        metrics == NULL || branch->block_count == 0u) {
         return -1;
     }
 
-    const bridge_page_header_t *hdr0 = (const bridge_page_header_t *)ptrs[0];
-    size_t total = (size_t)hdr0->total_state_bytes;
-    uint8_t *buf = (uint8_t *)malloc(total);
-    if (buf == NULL) {
-        return -1;
-    }
+    const size_t aligned_blk = (size_t)(((arena->block_size_bytes + VTLK_KV_CACHE_LINE - 1u) /
+                                         VTLK_KV_CACHE_LINE) * VTLK_KV_CACHE_LINE);
+    size_t total = 0u;
+    int is_contiguous = 1;
 
-    size_t cursor = 0;
-    for (uint32_t i = 0; i < prefix_blocks; ++i) {
-        const bridge_page_header_t *ph = (const bridge_page_header_t *)ptrs[i];
-        const uint8_t *payload = (const uint8_t *)ptrs[i] + sizeof(bridge_page_header_t);
-        if (cursor + ph->page_payload_bytes > total) {
-            free(buf);
+    for (uint32_t i = 0; i < branch->block_count; ++i) {
+        const vtlk_kv_block_header_t *hdr = vtlk_kv_block_header(arena, branch->block_ids[i]);
+        if (hdr == NULL || ptrs[i] == NULL) {
             return -1;
         }
-        memcpy(buf + cursor, payload, ph->page_payload_bytes);
-        cursor += ph->page_payload_bytes;
+        uint32_t page_bytes = hdr->reserved_imm;
+        if (page_bytes == 0u || (uint64_t)page_bytes > arena->block_size_bytes) {
+            return -1;
+        }
+        if (i + 1u < branch->block_count && (uint64_t)page_bytes != arena->block_size_bytes) {
+            return -1;
+        }
+        if (i > 0u && (const uint8_t *)ptrs[i] != (const uint8_t *)ptrs[i - 1u] + aligned_blk) {
+            is_contiguous = 0;
+        }
+        total += (size_t)page_bytes;
     }
 
-    if (cursor != total) {
-        free(buf);
-        return -1;
+    metrics->restore_heap_allocs = 0u;
+    if (is_contiguous) {
+        *out_ptr = (const uint8_t *)ptrs[0];
+        metrics->mapped_zero_copy_bytes = total;
+        metrics->copied_bytes = 0u;
+    } else {
+        if (prealloc_buf == NULL || total > prealloc_cap) {
+            return -1;
+        }
+        size_t cursor = 0u;
+        for (uint32_t i = 0; i < branch->block_count; ++i) {
+            const vtlk_kv_block_header_t *hdr = vtlk_kv_block_header(arena, branch->block_ids[i]);
+            uint32_t page_bytes = hdr->reserved_imm;
+            memcpy(prealloc_buf + cursor, ptrs[i], page_bytes);
+            cursor += (size_t)page_bytes;
+        }
+        *out_ptr = prealloc_buf;
+        metrics->mapped_zero_copy_bytes = 0u;
+        metrics->copied_bytes = total;
     }
 
-    *out_buf = buf;
     *out_bytes = total;
-    *out_pos_n = hdr0->pos_n;
+    *out_pos_n = branch->total_tokens;
     return 0;
 }
 
@@ -295,12 +318,17 @@ static int run_self_test(uint32_t num_workers)
             return 1;
         }
 
-        uint8_t *restored_buf = NULL;
+        const uint8_t *restored_ptr = NULL;
         size_t restored_bytes = 0;
         uint32_t restored_pos = 0;
-        if (reassemble_state_from_ptrs(ptrs, forked.block_count, forked.block_count,
-                                       &restored_buf, &restored_bytes, &restored_pos) != 0) {
-            fprintf(stderr, "worker %u: reassemble failed\n", w);
+        bridge_restore_metrics_t metrics;
+        uint8_t fallback_buf[9000];
+
+        if (prepare_restore_view(&arena, &forked, ptrs,
+                                 fallback_buf, sizeof(fallback_buf),
+                                 &restored_ptr, &restored_bytes,
+                                 &restored_pos, &metrics) != 0) {
+            fprintf(stderr, "worker %u: restore view failed\n", w);
             vtlk_kv_branch_release(&arena, &forked);
             free(synth_state);
             vtlk_kv_arena_close(&arena);
@@ -309,16 +337,14 @@ static int run_self_test(uint32_t num_workers)
         }
 
         if (restored_pos != pos_n || restored_bytes != synth_bytes ||
-            memcmp(restored_buf, synth_state, synth_bytes) != 0) {
+            memcmp(restored_ptr, synth_state, synth_bytes) != 0) {
             fprintf(stderr, "worker %u: state mismatch!\n", w);
-            free(restored_buf);
             vtlk_kv_branch_release(&arena, &forked);
             free(synth_state);
             vtlk_kv_arena_close(&arena);
             vtlk_shm_unlink(shm_name);
             return 1;
         }
-        free(restored_buf);
 
         /* Append worker-specific continuation block at pos = N */
         uint32_t cont_tok = 9000u + w;
@@ -340,8 +366,11 @@ static int run_self_test(uint32_t num_workers)
         vtlk_kv_branch_append_block(&arena, &forked, cont_bid);
         vtlk_kv_block_release(&arena, cont_bid);
 
-        printf("[worker %u] fork+restore OK (pos=%u, shared_blocks=%u, total_tokens=%u)\n",
-               w, restored_pos, forked.block_count - 1u, forked.total_tokens);
+        printf("[worker %u] fork+restore OK (pos=%u, shared_blocks=%u, total_tokens=%u, "
+               "mapped_zero_copy_bytes=%zu, copied_bytes=%zu, restore_heap_allocs=%u)\n",
+               w, restored_pos, forked.block_count - 1u, forked.total_tokens,
+               metrics.mapped_zero_copy_bytes, metrics.copied_bytes,
+               metrics.restore_heap_allocs);
 
         vtlk_kv_branch_release(&arena, &forked);
     }
@@ -456,8 +485,11 @@ static int run_llama_model_mode(const char *model_path,
     char shm_name[128];
     snprintf(shm_name, sizeof(shm_name), "/vtlk_lpb_%d", VTLK_GETPID());
 
+    uint32_t needed_blocks = (uint32_t)((state_size + BRIDGE_PAGE_BYTES - 1u) / BRIDGE_PAGE_BYTES) + 16u;
+    uint32_t arena_blocks = needed_blocks > BRIDGE_ARENA_BLOCKS ? needed_blocks : BRIDGE_ARENA_BLOCKS;
+
     vtlk_kv_arena_t arena;
-    if (vtlk_kv_arena_create(&arena, shm_name, BRIDGE_ARENA_BLOCKS, BRIDGE_PAGE_BYTES) != VTLK_OK) {
+    if (vtlk_kv_arena_create(&arena, shm_name, arena_blocks, BRIDGE_PAGE_BYTES) != VTLK_OK) {
         fprintf(stderr, "vtlk_kv_arena_create failed\n");
         free(state_buf);
         llama_free(ctx);
@@ -511,6 +543,17 @@ static int run_llama_model_mode(const char *model_path,
 
     printf("[producer] prefill pos=%d, state=%zu B (%u paged blocks), snapshot_id=%llu\n",
            n_tok, state_size, paged_blocks, (unsigned long long)snap_id);
+
+    uint8_t *fallback_buf = (uint8_t *)malloc(state_size);
+    if (fallback_buf == NULL) {
+        vtlk_kv_arena_close(&arena);
+        vtlk_shm_unlink(shm_name);
+        free(state_buf);
+        llama_free(ctx);
+        free(tokens);
+        llama_model_free(model);
+        return 1;
+    }
 
     int all_exact = 1;
     for (uint32_t w = 0; w < num_workers; ++w) {
@@ -585,17 +628,19 @@ static int run_llama_model_mode(const char *model_path,
             break;
         }
 
-        uint8_t *w_state = NULL;
+        const uint8_t *w_state_ptr = NULL;
         size_t w_bytes = 0;
         uint32_t w_pos = 0;
+        bridge_restore_metrics_t metrics;
         llama_token cow_gen[16];
         double max_logit_diff = 0.0;
         uint32_t exact_tokens = 0u;
 
-        if (reassemble_state_from_ptrs(ptrs, forked.block_count, forked.block_count,
-                                       &w_state, &w_bytes, &w_pos) == 0) {
+        if (prepare_restore_view(&arena, &forked, ptrs,
+                                 fallback_buf, state_size,
+                                 &w_state_ptr, &w_bytes, &w_pos, &metrics) == 0) {
             struct llama_context *wctx = llama_init_from_model(model, cparams);
-            llama_state_seq_set_data(wctx, w_state, w_bytes, 0);
+            llama_state_seq_set_data(wctx, w_state_ptr, w_bytes, 0);
 
             struct llama_batch wb = llama_batch_init(n_suf, 0, 1);
             wb.n_tokens = n_suf;
@@ -638,17 +683,22 @@ static int run_llama_model_mode(const char *model_path,
             if (exact_tokens != gen_len) {
                 all_exact = 0;
             }
-            printf("[branch %u] suffix_toks=%d | token_match=%u/%u | max_logit_diff=%.6f\n",
-                   w, n_suf, exact_tokens, gen_len, max_logit_diff);
+            printf("[branch %u] suffix_toks=%d | token_match=%u/%u | max_logit_diff=%.6f | "
+                   "mapped_zero_copy_bytes=%zu | copied_bytes=%zu | restore_heap_allocs=%u\n",
+                   w, n_suf, exact_tokens, gen_len, max_logit_diff,
+                   metrics.mapped_zero_copy_bytes, metrics.copied_bytes,
+                   metrics.restore_heap_allocs);
 
             llama_free(wctx);
-            free(w_state);
+        } else {
+            all_exact = 0;
         }
         vtlk_kv_branch_release(&arena, &forked);
         free(base_logits);
         free(suf_toks);
     }
 
+    free(fallback_buf);
     vtlk_kv_arena_close(&arena);
     vtlk_shm_unlink(shm_name);
     free(state_buf);
