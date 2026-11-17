@@ -812,7 +812,7 @@ static int run_cold_consumer(const char *shm_name2, const char *l3_dir)
     vtlk_kv_dag_t dag;
     vtlk_kv_checkpoint_meta_t meta;
     cold_dag_payload_t payload;
-    uint64_t out_len = 0u;
+    size_t out_len = 0u;
     uint32_t i;
 
     snprintf(l2_path, sizeof(l2_path), "vtlk_cold_l2_c.bin");
